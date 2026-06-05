@@ -222,6 +222,27 @@ def _get_optional_request_param(request_context: AuthorizationRequest, param: st
     return value
 
 
+def _has_explicit_empty_request_param(request_context: AuthorizationRequest, param: str) -> bool:
+    """Return True when the request mentions *param* with an explicitly empty string value."""
+    for mapping in (
+        request_context.path_params,
+        request_context.query_params,
+        request_context.json_body if isinstance(request_context.json_body, dict) else None,
+    ):
+        if not isinstance(mapping, dict) or param not in mapping:
+            continue
+        raw_value = mapping.get(param)
+        if isinstance(raw_value, str) and raw_value == "":
+            return True
+        if (
+            isinstance(raw_value, list)
+            and raw_value
+            and all(isinstance(item, str) and item == "" for item in raw_value)
+        ):
+            return True
+    return False
+
+
 def _get_header(request_context: AuthorizationRequest, header_name: str) -> str | None:
     return _normalize_string(request_context.headers.get(header_name.lower()))
 
@@ -431,7 +452,45 @@ def _parse_experiment_name(request_context: AuthorizationRequest) -> tuple[str, 
 
 
 def _parse_experiment_id_to_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
-    experiment_id = _get_request_param(request_context, "experiment_id")
+    """Resolve ``experiment_id`` to an experiment name for targeted auth checks.
+
+    This parser distinguishes three cases:
+
+    1. The request does not mention ``experiment_id`` at all.
+       Raise ``ResourceReferenceNotPresentError`` so hybrid rules like
+       ``ListScorers`` can fall back to their collection-response path.
+
+    2. The request mentions ``experiment_id`` but the value is explicitly empty.
+       Treat that the same as "no usable experiment_id reference was provided"
+       because MLflow 3.13 handles an empty scorer ``experiment_id`` as the
+       cross-experiment listing path.
+
+    3. The request mentions ``experiment_id`` but it is still unusable as a
+       single identifier (for example conflicting multi-valued query params, or
+       a DELETE request where only the ignored query-string form is present).
+       Raise ``ResourceNameResolutionError`` so callers keep the older
+       fail-closed behavior for malformed targeted requests.
+    """
+    experiment_id = _get_optional_request_param(request_context, "experiment_id")
+    if experiment_id is None:
+        if _has_explicit_empty_request_param(request_context, "experiment_id"):
+            raise ResourceReferenceNotPresentError(
+                "Request did not provide a usable experiment_id reference."
+            )
+        if (
+            "experiment_id" in request_context.path_params
+            or "experiment_id" in request_context.query_params
+            or (
+                isinstance(request_context.json_body, dict)
+                and "experiment_id" in request_context.json_body
+            )
+        ):
+            raise ResourceNameResolutionError(
+                "Missing required parameter 'experiment_id' for authorization."
+            )
+        raise ResourceReferenceNotPresentError(
+            "Request did not provide a usable experiment_id reference."
+        )
     return (_resolve_experiment_name_from_experiment_id(experiment_id),)
 
 
@@ -658,7 +717,7 @@ def _parse_optional_action_endpoint_id_to_name(
 
 
 def _parse_gateway_proxy_endpoint_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
-    if path_endpoint_name := _get_optional_request_param(request_context, "endpoint_name"):
+    if path_endpoint_name := _normalize_string(request_context.path_params.get("endpoint_name")):
         return (path_endpoint_name,)
     gateway_path = _get_optional_request_param(request_context, "gateway_path")
     model_name = _get_optional_request_param(request_context, "model")

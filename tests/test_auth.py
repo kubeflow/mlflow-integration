@@ -51,6 +51,7 @@ from mlflow.protos.service_pb2 import (
     GetPromptOptimizationJob,
     GetWorkspace,
     ListGatewayEndpointBindings,
+    ListScorers,
     ListWorkspaces,
     RemoveDatasetFromExperiments,
     SearchPromptOptimizationJobs,
@@ -64,6 +65,7 @@ from mlflow.protos.service_pb2 import (
 from mlflow.protos.webhooks_pb2 import DeleteWebhook, GetWebhook, UpdateWebhook
 from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
 from mlflow_kubernetes_plugins.auth._compat import (
+    HAS_MLFLOW_3_13_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     BatchGetTraceInfos,
     CreateGatewayBudgetPolicy,
@@ -99,6 +101,7 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_SCORERS,
     COLLECTION_POLICY_RESPONSE_TRACES,
     apply_request_collection_filter,
     apply_response_collection_filters,
@@ -2213,6 +2216,211 @@ def test_apply_request_collection_filter_denies_single_experiment_id_when_query_
     assert allowed is False
 
 
+def test_authorize_request_denies_targeted_list_scorers_without_experiment_access(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    rule = AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: "exp-denied",
+    )
+
+    with pytest.raises(MlflowException, match="Permission denied") as exc:
+        _authorize_request(
+            AuthorizationRequest(
+                authorization_header="Bearer scorer-token",
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/ajax-api/3.0/mlflow/scorers/list",
+                method="GET",
+                workspace="team-a",
+                query_params={"experiment_id": "1"},
+            ),
+            authorizer=authorizer,
+            config_values=KubernetesAuthConfig(),
+        )
+
+    assert exc.value.error_code == databricks_pb2.ErrorCode.Name(databricks_pb2.PERMISSION_DENIED)
+    second_call = authorizer.is_allowed.call_args_list[1]
+    assert second_call.kwargs == {"resource_name": "exp-denied"}
+
+
+def test_authorize_request_uses_targeted_experiment_access_for_list_scorers(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a"
+    )
+    rule = AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: "exp-a",
+    )
+
+    result = _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer scorer-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/ajax-api/3.0/mlflow/scorers/list",
+            method="GET",
+            workspace="team-a",
+            query_params={"experiment_id": "1"},
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    assert result.response_filter_required is False
+    second_call = authorizer.is_allowed.call_args_list[1]
+    assert second_call.kwargs == {"resource_name": "exp-a"}
+
+
+def test_authorize_request_marks_cross_experiment_list_scorers_for_response_filter(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[1] == RESOURCE_EXPERIMENTS and kwargs.get("resource_name") is None
+    )
+    rule = AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+
+    result = _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer scorer-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/ajax-api/3.0/mlflow/scorers/list",
+            method="GET",
+            workspace="team-a",
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    assert result.response_filter_required is True
+    assert authorizer.is_allowed.call_count == 1
+
+
+def test_authorize_request_treats_blank_experiment_id_as_cross_experiment_list_for_scorers(
+    monkeypatch,
+):
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    rule = AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+
+    result = _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer scorer-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/ajax-api/3.0/mlflow/scorers/list",
+            method="GET",
+            workspace="team-a",
+            query_params={"experiment_id": ""},
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    assert result.response_filter_required is True
+
+
+def test_authorize_request_rejects_whitespace_only_experiment_id_for_scorers(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    rule = AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+
+    with pytest.raises(MlflowException, match="Permission denied") as exc:
+        _authorize_request(
+            AuthorizationRequest(
+                authorization_header="Bearer scorer-token",
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/ajax-api/3.0/mlflow/scorers/list",
+                method="GET",
+                workspace="team-a",
+                query_params={"experiment_id": "   "},
+            ),
+            authorizer=authorizer,
+            config_values=KubernetesAuthConfig(),
+        )
+
+    assert exc.value.error_code == databricks_pb2.ErrorCode.Name(databricks_pb2.PERMISSION_DENIED)
+
+
 def test_authorize_request_prefilters_run_ids_after_broad_denial(monkeypatch):
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
@@ -2733,6 +2941,30 @@ def test_mlflow_312_request_authorization_rules_cover_new_endpoints():
     }
     for request_class, expected_rule in gateway_rules.items():
         assert REQUEST_AUTHORIZATION_RULES[request_class] == expected_rule
+
+
+def test_mlflow_313_request_authorization_rules_cover_cross_experiment_list_scorers():
+    if not HAS_MLFLOW_3_13_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.13 scorer-list behavior.")
+
+    assert REQUEST_AUTHORIZATION_RULES[ListScorers] == AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        fallback_to_collection_policy_on_missing_resource_reference=True,
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/providers/<provider>/models", "GET")
+    ] == AuthorizationRule("get", resource=RESOURCE_ASSISTANTS)
+    assert PATH_AUTHORIZATION_RULES[("/gateway/proxy/<endpoint_name>/<path:path>", "POST")] == (
+        AuthorizationRule(
+            "create",
+            resource=RESOURCE_GATEWAY_ENDPOINTS,
+            subresource="use",
+            resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+        )
+    )
 
 
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
@@ -3724,6 +3956,39 @@ def test_apply_response_collection_filters_filters_experiments():
     assert filtered == {"experiments": [{"experiment_id": "1", "name": "exp-a"}]}
 
 
+def test_apply_response_collection_filters_filters_scorers(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a"
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
+    )
+
+    filtered, enforceable = apply_response_collection_filters(
+        {
+            "scorers": [
+                {"experiment_id": "1", "scorer_name": "alpha"},
+                {"experiment_id": "2", "scorer_name": "beta"},
+            ]
+        },
+        [
+            AuthorizationRule(
+                "get",
+                resource=RESOURCE_EXPERIMENTS,
+                collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+            )
+        ],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert enforceable is True
+    assert filtered == {"scorers": [{"experiment_id": "1", "scorer_name": "alpha"}]}
+
+
 def test_apply_response_collection_filters_not_enforceable_on_unexpected_shape():
     authorizer = Mock()
     authorizer.is_allowed.return_value = False
@@ -4129,6 +4394,7 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
         ("/api/2.0/mlflow/gateway-proxy", "POST"),
         ("/ajax-api/2.0/mlflow/gateway-proxy", "POST"),
         ("/gateway/<endpoint_name>/mlflow/invocations", "POST"),
+        ("/gateway/proxy/<endpoint_name>/<path:path>", "POST"),
         ("/gateway/mlflow/v1/chat/completions", "POST"),
         ("/gateway/openai/v1/chat/completions", "POST"),
         ("/gateway/openai/v1/embeddings", "POST"),
@@ -4157,6 +4423,25 @@ def test_resolve_resource_names_reads_gateway_endpoint_name_from_model_field():
     )
 
     assert names == ("endpoint-a",)
+
+
+def test_resolve_resource_names_raw_proxy_prefers_path_endpoint_name_over_body():
+    names = resolve_resource_names(
+        AuthorizationRequest(
+            authorization_header=None,
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/gateway/proxy/path-endpoint/chat/completions",
+            method="POST",
+            workspace="team-a",
+            path_params={"endpoint_name": "path-endpoint", "path": "chat/completions"},
+            json_body={"endpoint_name": "body-endpoint", "model": "body-endpoint"},
+        ),
+        (RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    )
+
+    assert names == ("path-endpoint",)
 
 
 def test_resolve_resource_names_rejects_conflicting_gateway_path_and_model():

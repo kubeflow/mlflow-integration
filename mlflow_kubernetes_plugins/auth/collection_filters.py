@@ -31,6 +31,7 @@ COLLECTION_POLICY_REQUEST_RUN_IDS = "request_filter_run_ids"
 COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS = "request_filter_trace_locations"
 COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES = "response_filter_dataset_summaries"
 COLLECTION_POLICY_RESPONSE_EXPERIMENTS = "response_filter_experiments"
+COLLECTION_POLICY_RESPONSE_SCORERS = "response_filter_scorers"
 COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS = "response_filter_registered_models"
 COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS = "response_filter_model_versions"
 COLLECTION_POLICY_RESPONSE_TRACES = "response_filter_traces"
@@ -47,6 +48,7 @@ _REQUEST_FILTER_POLICIES = {
 _RESPONSE_FILTER_POLICIES = {
     COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_SCORERS,
     COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
     COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
     COLLECTION_POLICY_RESPONSE_TRACES,
@@ -523,6 +525,32 @@ def _filter_payload_registered_models(
     return True
 
 
+def _filter_payload_scorers(
+    payload: dict[str, object],
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> bool:
+    scorers = payload.get("scorers")
+    if scorers is None:
+        return True
+    if not isinstance(scorers, list):
+        return False
+    filtered_scorers: list[dict[str, object]] = []
+    for scorer in scorers:
+        if not isinstance(scorer, dict):
+            continue
+        experiment_id = _normalize_string(
+            _first_present_value(scorer, "experiment_id", "experimentId")
+        )
+        if experiment_id is None:
+            continue
+        if _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id):
+            filtered_scorers.append(scorer)
+    payload["scorers"] = filtered_scorers
+    return True
+
+
 def _filter_payload_model_versions(
     payload: dict[str, object],
     authorizer: "KubernetesAuthorizer",
@@ -624,6 +652,10 @@ def apply_response_collection_filters(
             enforceable &= _filter_payload_experiments(
                 filtered_payload, authorizer, identity, workspace_name
             )
+        elif policy == COLLECTION_POLICY_RESPONSE_SCORERS:
+            enforceable &= _filter_payload_scorers(
+                filtered_payload, authorizer, identity, workspace_name
+            )
         elif policy == COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS:
             enforceable &= _filter_payload_registered_models(
                 filtered_payload, authorizer, identity, workspace_name
@@ -683,6 +715,7 @@ __all__ = [
     "COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS",
     "COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES",
     "COLLECTION_POLICY_RESPONSE_EXPERIMENTS",
+    "COLLECTION_POLICY_RESPONSE_SCORERS",
     "COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS",
     "COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS",
     "COLLECTION_POLICY_RESPONSE_TRACES",

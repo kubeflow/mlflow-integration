@@ -710,9 +710,19 @@ async def _authorize_request_async(
                 workspace_name,
                 rule.subresource,
             )
+            broad_allowed = allowed
+            response_or_graphql_filter_policy = is_response_filter_policy(
+                rule.collection_policy
+            ) or is_graphql_collection_policy(rule.collection_policy)
+            hybrid_missing_reference_filter_rule = (
+                rule.resource_name_parsers
+                and rule.fallback_to_collection_policy_on_missing_resource_reference
+                and response_or_graphql_filter_policy
+            )
             # Fallback to resourceName when the user doesn't have the broad permissions.
             # This approach allows us to reuse cache SelfSubjectAccessReview of the common case
             # where a user has access to all resources to the workspace.
+            resource_reference_missing = False
             if not allowed and rule.resource_name_parsers:
                 updated_request_context = await _ensure_request_context_json_body(
                     updated_request_context
@@ -722,6 +732,7 @@ async def _authorize_request_async(
                         updated_request_context, rule.resource_name_parsers
                     )
                 except ResourceReferenceNotPresentError:
+                    resource_reference_missing = True
                     if rule.allow_if_resource_reference_missing:
                         continue
                     resource_names = ()
@@ -738,6 +749,25 @@ async def _authorize_request_async(
                     )
                     for resource_name in resource_names
                 )
+            # Hybrid rules like ListScorers still need us to record when the request took the
+            # unscoped collection path, even if the caller already has the broad permission.
+            # The middleware may later skip actual response filtering when that broad permission
+            # already covers every returned row, but the auth core still needs to classify the
+            # request shape correctly here.
+            response_filter_on_missing_reference = (
+                broad_allowed and hybrid_missing_reference_filter_rule
+            )
+            if response_filter_on_missing_reference:
+                updated_request_context = await _ensure_request_context_json_body(
+                    updated_request_context
+                )
+                try:
+                    resolve_resource_names(updated_request_context, rule.resource_name_parsers)
+                except ResourceReferenceNotPresentError:
+                    resource_reference_missing = True
+                    response_filter_required = True
+                except ResourceNameResolutionError:
+                    pass
             if not allowed and rule.collection_policy:
                 updated_request_context, request_filter_applied = apply_request_collection_filter(
                     updated_request_context,
@@ -761,11 +791,10 @@ async def _authorize_request_async(
                     )
                 if request_filter_applied:
                     allowed = True
-                elif is_response_filter_policy(
-                    rule.collection_policy
-                ) or is_graphql_collection_policy(rule.collection_policy):
-                    response_filter_required = True
-                    allowed = True
+                elif response_or_graphql_filter_policy:
+                    if not hybrid_missing_reference_filter_rule or resource_reference_missing:
+                        response_filter_required = True
+                        allowed = True
             if not allowed:
                 raise MlflowException(
                     "Permission denied for requested operation.",
