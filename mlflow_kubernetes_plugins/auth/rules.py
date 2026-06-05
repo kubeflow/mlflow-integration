@@ -7,6 +7,7 @@ from typing import NamedTuple
 from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_11_AUTH_SURFACE,
     HAS_MLFLOW_3_12_AUTH_SURFACE,
+    HAS_MLFLOW_3_13_AUTH_SURFACE,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     ALLOWED_RESOURCES,
@@ -36,6 +37,10 @@ class AuthorizationRule(NamedTuple):
     workspace_access_check: bool = False
     deny_message: str | None = None
     allow_if_resource_reference_missing: bool = False
+    # Some hybrid endpoints act like a named-resource read when a reference is present, but
+    # degrade to a broad collection read when it is absent. This flag allows response-filter
+    # fallback only in the "reference missing" case, not when the named-resource check fails.
+    fallback_to_collection_policy_on_missing_resource_reference: bool = False
     # Skip generic gateway dependency checks when a rule reuses a gateway resource for
     # authorization shape but does not actually consume that resource's usual dependencies.
     skip_gateway_dependency_permissions: bool = False
@@ -115,6 +120,7 @@ from mlflow_kubernetes_plugins.auth.rules_base import (  # noqa: E402
 )
 from mlflow_kubernetes_plugins.auth.rules_v3_11 import apply_v3_11_deltas  # noqa: E402
 from mlflow_kubernetes_plugins.auth.rules_v3_12 import apply_v3_12_deltas  # noqa: E402
+from mlflow_kubernetes_plugins.auth.rules_v3_13 import apply_v3_13_deltas  # noqa: E402
 
 REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationRule, ...]] = dict(
     BASE_REQUEST_AUTHORIZATION_RULES
@@ -130,6 +136,11 @@ if HAS_MLFLOW_3_11_AUTH_SURFACE:
     )
 if HAS_MLFLOW_3_12_AUTH_SURFACE:
     apply_v3_12_deltas(
+        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
+        path_authorization_rules=PATH_AUTHORIZATION_RULES,
+    )
+if HAS_MLFLOW_3_13_AUTH_SURFACE:
+    apply_v3_13_deltas(
         request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
         path_authorization_rules=PATH_AUTHORIZATION_RULES,
     )
