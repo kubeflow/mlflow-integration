@@ -19,8 +19,8 @@ spec:
       openAPIV3Schema:
         description: |-
           MLflowConfig is a namespace-scoped configuration resource that allows
-          Kubernetes namespace owners to override the default artifact storage
-          for their namespace.
+          Kubernetes namespace owners to override the default artifact storage and,
+          on MLflow 3.13+, trace archival settings for their namespace.
         properties:
           apiVersion:
             description: |-
@@ -42,6 +42,50 @@ spec:
           spec:
             description: spec defines the desired MLflow configuration for this namespace.
             properties:
+              archiveRootPath:
+                description: |-
+                  ArchiveRootPath is an optional relative path from the bucket root specified in
+                  ArchiveRootSecret. When provided, this path is appended to the bucket URI
+                  from the secret to form the resolved trace archival root.
+
+                  Example:
+                    archiveRootSecret: "mlflow-archive-secret"  # Contains bucket: ds-team-trace-archive
+                    archiveRootPath: "traces"
+                    resolved trace archival root: s3://ds-team-trace-archive/traces
+                maxLength: 512
+                type: string
+                x-kubernetes-validations:
+                - message: archiveRootPath must be relative
+                  rule: self == '' || !self.startsWith('/')
+                - message: archiveRootPath must not contain '..' path segments
+                  rule: self == '' || !self.matches(r'(^|.*/)\.\.(|/.*)$')
+              archiveRootSecret:
+                description: |-
+                  ArchiveRootSecret is the fixed secret contract for namespace-scoped trace archival
+                  location overrides.
+
+                  The provider currently reads only AWS_S3_BUCKET from this Secret to derive
+                  the workspace trace archival root. It does not retrieve or inject
+                  workspace-scoped credentials into MLflow trace archival operations yet.
+
+                  The Secret may still include the usual s3-compatible keys:
+                  Example Secret:
+                    apiVersion: v1
+                    kind: Secret
+                    metadata:
+                      name: mlflow-archive-secret
+                      namespace: ds-team-namespace
+                    data:
+                      AWS_ACCESS_KEY_ID: <base64-encoded>
+                      AWS_SECRET_ACCESS_KEY: <base64-encoded>
+                      AWS_S3_BUCKET: <base64-encoded>
+                      AWS_S3_ENDPOINT: <base64-encoded>
+                      AWS_DEFAULT_REGION: <base64-encoded>  # Optional (default region is not always required, e.g. minio)
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: archiveRootSecret must be 'mlflow-archive-secret'
+                  rule: self == 'mlflow-archive-secret'
               artifactRootPath:
                 description: |-
                   ArtifactRootPath is an optional relative path from the bucket root specified in
@@ -61,10 +105,14 @@ spec:
                   rule: self == '' || !self.matches(r'(^|.*/)\.\.(|/.*)$')
               artifactRootSecret:
                 description: |-
-                  ArtifactRootSecret is the name of a Secret in this namespace that contains
-                  credentials and bucket information for accessing the artifact storage.
+                  ArtifactRootSecret is the fixed secret contract for namespace-scoped artifact
+                  root overrides.
 
-                  The Secret must have the required keys for s3 compatible storage:
+                  The provider currently reads only AWS_S3_BUCKET from this Secret to derive
+                  the workspace artifact root. It does not retrieve or inject workspace-scoped
+                  credentials into MLflow artifact operations yet.
+
+                  The Secret may still include the usual s3-compatible keys:
                   Example Secret:
                     apiVersion: v1
                     kind: Secret
@@ -82,9 +130,26 @@ spec:
                 x-kubernetes-validations:
                 - message: artifactRootSecret must be 'mlflow-artifact-connection'
                   rule: self == 'mlflow-artifact-connection'
-            required:
-            - artifactRootSecret
+              traceArchivalRetention:
+                description: |-
+                  TraceArchivalRetention overrides the workspace-level trace archival retention when
+                  MLflow 3.13+ trace archival is enabled on the server.
+
+                  Format: <int><unit>, where unit is one of:
+                    - m: minutes
+                    - h: hours
+                    - d: days
+
+                  Examples: "30d", "12h", "90m"
+                maxLength: 32
+                pattern: ^[1-9][0-9]*[mhd]$
+                type: string
             type: object
+            x-kubernetes-validations:
+            - message: artifactRootSecret is required when artifactRootPath is set
+              rule: '!has(self.artifactRootPath) || has(self.artifactRootSecret)'
+            - message: archiveRootSecret is required when archiveRootPath is set
+              rule: '!has(self.archiveRootPath) || has(self.archiveRootSecret)'
         required:
         - spec
         type: object

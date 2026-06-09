@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 from kubernetes.client.exceptions import ApiException
 from mlflow.exceptions import MlflowException
+from mlflow_kubernetes_plugins.workspace_plugin._compat import (
+    HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+)
 from mlflow_kubernetes_plugins.workspace_plugin.caches import (
+    ARCHIVE_CONNECTION_SECRET_NAME,
     ARTIFACT_CONNECTION_SECRET_NAME,
     MlflowConfigCache,
     SecretCache,
@@ -87,12 +91,17 @@ def _namespace(name: str, description: str | None = None):
     return SimpleNamespace(metadata=metadata)
 
 
-def _secret(namespace: str, bucket: str | None = None):
+def _secret(
+    namespace: str,
+    bucket: str | None = None,
+    *,
+    name: str = ARTIFACT_CONNECTION_SECRET_NAME,
+):
     data = {}
     if bucket is not None:
         data["AWS_S3_BUCKET"] = base64.b64encode(bucket.encode()).decode()
     metadata = SimpleNamespace(
-        name=ARTIFACT_CONNECTION_SECRET_NAME,
+        name=name,
         namespace=namespace,
         resource_version="1",
     )
@@ -229,11 +238,27 @@ def test_create_workspace_store_parses_uri_options(core_api):
     )
 
 
-def _mlflow_config(namespace: str, secret: str, path: str | None = None):
+def _mlflow_config(
+    namespace: str,
+    secret: str | None = None,
+    path: str | None = None,
+    *,
+    archive_secret: str | None = None,
+    archive_path: str | None = None,
+    trace_archival_retention: str | None = None,
+):
     """Helper to create a mock MLflowConfig CRD response."""
-    spec = {"artifactRootSecret": secret}
+    spec = {}
+    if secret is not None:
+        spec["artifactRootSecret"] = secret
     if path is not None:
         spec["artifactRootPath"] = path
+    if archive_secret is not None:
+        spec["archiveRootSecret"] = archive_secret
+    if archive_path is not None:
+        spec["archiveRootPath"] = archive_path
+    if trace_archival_retention is not None:
+        spec["traceArchivalRetention"] = trace_archival_retention
     return {
         "metadata": {"namespace": namespace, "resourceVersion": "1"},
         "spec": spec,
@@ -244,8 +269,19 @@ def test_mlflow_config_cache_loads_configs(monkeypatch):
     mock_api = MagicMock()
     mock_api.list_cluster_custom_object.return_value = {
         "items": [
-            _mlflow_config("team-a", "team-a-secret", "experiments"),
-            _mlflow_config("team-b", "team-b-secret"),
+            _mlflow_config(
+                "team-a",
+                "team-a-secret",
+                "experiments",
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+                archive_path="traces",
+                trace_archival_retention="14d",
+            ),
+            _mlflow_config(
+                "team-b",
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+                trace_archival_retention="7d",
+            ),
         ],
         "metadata": {"resourceVersion": "10"},
     }
@@ -262,11 +298,17 @@ def test_mlflow_config_cache_loads_configs(monkeypatch):
     assert config_a.namespace == "team-a"
     assert config_a.artifact_root_secret == "team-a-secret"
     assert config_a.artifact_root_path == "experiments"
+    assert config_a.archive_root_secret == ARCHIVE_CONNECTION_SECRET_NAME
+    assert config_a.archive_root_path == "traces"
+    assert config_a.trace_archival_retention == "14d"
 
     config_b = cache.get_config("team-b")
     assert config_b is not None
-    assert config_b.artifact_root_secret == "team-b-secret"
+    assert config_b.artifact_root_secret is None
     assert config_b.artifact_root_path is None
+    assert config_b.archive_root_secret == ARCHIVE_CONNECTION_SECRET_NAME
+    assert config_b.archive_root_path is None
+    assert config_b.trace_archival_retention == "7d"
 
 
 def test_mlflow_config_cache_returns_none_for_unknown_namespace(monkeypatch):
@@ -389,6 +431,33 @@ def test_mlflow_config_cache_does_not_ensure_secret_cache_for_other_secret(monke
     )
 
     ensure_secret_cache.assert_not_called()
+
+
+def test_mlflow_config_cache_ensures_archive_secret_cache_for_supported_secret(monkeypatch):
+    mock_api = MagicMock()
+    mock_api.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                None,
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+            )
+        ],
+        "metadata": {"resourceVersion": "5"},
+    }
+    ensure_archive_secret_cache = MagicMock()
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.watch.Watch",
+        lambda: _FakeWatch(),
+    )
+
+    MlflowConfigCache(
+        mock_api,
+        ensure_archive_connection_secret_cache=ensure_archive_secret_cache,
+    )
+
+    ensure_archive_secret_cache.assert_called_once_with()
 
 
 def test_resolve_artifact_root_returns_default_when_no_workspace(mock_apis):
@@ -559,6 +628,58 @@ def test_secret_cache_starts_when_mlflow_config_seen(mock_apis):
     mock_apis.core.list_secret_for_all_namespaces.assert_called_once()
 
 
+def test_archive_secret_cache_starts_when_mlflow_config_seen(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                None,
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-a", "team-a-archive", name=ARCHIVE_CONNECTION_SECRET_NAME)],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+
+    provider = KubernetesWorkspaceProvider()
+
+    assert provider._archive_secret_cache is not None
+    mock_apis.core.list_secret_for_all_namespaces.assert_called_once()
+
+
+def test_archive_secret_cache_not_started_without_mlflow_3_13_surface(mock_apis, monkeypatch):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                None,
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.provider.HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE",
+        False,
+    )
+
+    provider = KubernetesWorkspaceProvider()
+
+    assert provider._archive_secret_cache is None
+    mock_apis.core.list_secret_for_all_namespaces.assert_not_called()
+
+
 def test_secret_cache_raises_on_transient_error(mock_apis):
     mock_apis.core.list_namespace.return_value = SimpleNamespace(
         items=[_namespace("team-a")],
@@ -586,6 +707,37 @@ def _make_provider_with_path(mock_apis, path):
     }
     mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
         items=[_secret("team-a", "team-a-bucket")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    return KubernetesWorkspaceProvider()
+
+
+def _make_provider_with_archive_config(
+    mock_apis,
+    *,
+    archive_path: str | None = None,
+    archive_secret: str = ARCHIVE_CONNECTION_SECRET_NAME,
+    trace_archival_retention: str | None = None,
+):
+    """Helper: set up a provider with archive override fields."""
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                None,
+                archive_secret=archive_secret,
+                archive_path=archive_path,
+                trace_archival_retention=trace_archival_retention,
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-a", "team-a-archive", name=ARCHIVE_CONNECTION_SECRET_NAME)],
         metadata=SimpleNamespace(resource_version="1"),
     )
     return KubernetesWorkspaceProvider()
@@ -665,6 +817,197 @@ def test_validate_artifact_path_normalizes_redundant_slashes(mock_apis):
     assert should_append is False
 
 
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_returns_defaults(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+
+    provider = KubernetesWorkspaceProvider()
+
+    config = provider.resolve_trace_archival_config("s3://archive/default", "30d", "")
+
+    assert config.config.location == "s3://archive/default"
+    assert config.config.retention == "30d"
+    assert config.append_workspace_prefix is True
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_uses_archive_secret_and_retention(mock_apis):
+    provider = _make_provider_with_archive_config(
+        mock_apis,
+        archive_path="traces/data",
+        trace_archival_retention="14d",
+    )
+
+    config = provider.resolve_trace_archival_config(
+        "s3://archive/default",
+        "30d",
+        "team-a",
+    )
+
+    assert config.config.location == "s3://team-a-archive/traces/data"
+    assert config.config.retention == "14d"
+    assert config.append_workspace_prefix is False
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_supports_retention_only_override(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                trace_archival_retention="14d",
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+
+    provider = KubernetesWorkspaceProvider()
+
+    config = provider.resolve_trace_archival_config(
+        "s3://archive/default",
+        "30d",
+        "team-a",
+    )
+
+    assert config.config.location == "s3://archive/default"
+    assert config.config.retention == "14d"
+    assert config.append_workspace_prefix is True
+
+
+def test_resolve_artifact_root_ignores_archive_only_config(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+                archive_path="traces",
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+
+    provider = KubernetesWorkspaceProvider()
+
+    root, should_append = provider.resolve_artifact_root("s3://default-bucket", "team-a")
+
+    assert root == "s3://default-bucket"
+    assert should_append is True
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_rejects_wrong_archive_secret_name(mock_apis):
+    provider = _make_provider_with_archive_config(
+        mock_apis,
+        archive_secret="some-other-secret",
+    )
+
+    with pytest.raises(MlflowException, match="only 'mlflow-archive-secret' is supported"):
+        provider.resolve_trace_archival_config("s3://archive/default", "30d", "team-a")
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+@pytest.mark.parametrize(
+    "malicious_path",
+    [
+        "..",
+        "../foo",
+        "foo/../../bar",
+    ],
+)
+def test_resolve_trace_archival_config_rejects_archive_path_traversal(mock_apis, malicious_path):
+    provider = _make_provider_with_archive_config(mock_apis, archive_path=malicious_path)
+
+    with pytest.raises(MlflowException, match="Path traversal"):
+        provider.resolve_trace_archival_config("s3://archive/default", "30d", "team-a")
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_rejects_missing_archive_secret(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                ARTIFACT_CONNECTION_SECRET_NAME,
+                archive_path="traces",
+                trace_archival_retention="14d",
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-a", "team-a-bucket")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+
+    provider = KubernetesWorkspaceProvider()
+
+    with pytest.raises(MlflowException, match="sets archiveRootPath without archiveRootSecret"):
+        provider.resolve_trace_archival_config("s3://archive/default", "30d", "team-a")
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_resolve_trace_archival_config_rejects_invalid_retention(mock_apis):
+    provider = _make_provider_with_archive_config(
+        mock_apis,
+        archive_path="traces",
+        trace_archival_retention="invalid",
+    )
+
+    with pytest.raises(MlflowException, match="traceArchivalRetention"):
+        provider.resolve_trace_archival_config("s3://archive/default", "30d", "team-a")
+
+
+def test_resolve_trace_archival_config_requires_mlflow_3_13_support(mock_apis, monkeypatch):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    provider = KubernetesWorkspaceProvider()
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.provider.HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE",
+        False,
+    )
+
+    with pytest.raises(NotImplementedError, match="MLflow 3.13\\+"):
+        provider.resolve_trace_archival_config("s3://archive/default", "30d", "team-a")
+
+
 def test_get_workspace_includes_artifact_root(mock_apis):
     mock_apis.core.list_namespace.return_value = SimpleNamespace(
         items=[_namespace("team-a", "Team A")],
@@ -685,6 +1028,40 @@ def test_get_workspace_includes_artifact_root(mock_apis):
     assert workspace.name == "team-a"
     assert workspace.description == "Team A"
     assert workspace.default_artifact_root == "s3://team-a-bucket/experiments"
+
+
+@pytest.mark.skipif(
+    not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+    reason="Installed MLflow version does not expose workspace trace archival support.",
+)
+def test_get_workspace_includes_trace_archival_overrides(mock_apis):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a", "Team A")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+                archive_path="traces",
+                trace_archival_retention="14d",
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-a", "team-a-archive", name=ARCHIVE_CONNECTION_SECRET_NAME)],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+
+    provider = KubernetesWorkspaceProvider()
+    workspace = provider.get_workspace("team-a")
+
+    assert workspace.name == "team-a"
+    assert workspace.default_artifact_root is None
+    assert workspace.trace_archival_location == "s3://team-a-archive/traces"
+    assert workspace.trace_archival_retention == "14d"
 
 
 def test_list_workspaces_includes_artifact_root(mock_apis):
@@ -728,6 +1105,41 @@ def test_get_workspace_ignores_config_error(mock_apis):
 
     assert workspace.name == "team-a"
     assert workspace.default_artifact_root is None
+
+
+def test_get_workspace_skips_trace_archival_metadata_when_support_disabled(mock_apis, monkeypatch):
+    mock_apis.core.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("team-a", "Team A")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    mock_apis.custom.list_cluster_custom_object.return_value = {
+        "items": [
+            _mlflow_config(
+                "team-a",
+                ARTIFACT_CONNECTION_SECRET_NAME,
+                archive_secret=ARCHIVE_CONNECTION_SECRET_NAME,
+                archive_path="traces",
+                trace_archival_retention="14d",
+            )
+        ],
+        "metadata": {"resourceVersion": "1"},
+    }
+    mock_apis.core.list_secret_for_all_namespaces.return_value = SimpleNamespace(
+        items=[_secret("team-a", "team-a-bucket")],
+        metadata=SimpleNamespace(resource_version="1"),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.provider.HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE",
+        False,
+    )
+
+    provider = KubernetesWorkspaceProvider()
+    workspace = provider.get_workspace("team-a")
+
+    if hasattr(workspace, "trace_archival_location"):
+        assert workspace.trace_archival_location is None
+    if hasattr(workspace, "trace_archival_retention"):
+        assert workspace.trace_archival_retention is None
 
 
 def test_resolve_artifact_root_rejects_wrong_secret_name(mock_apis):

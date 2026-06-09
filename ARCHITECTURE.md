@@ -28,8 +28,8 @@ behavior and configuration, see the docs in [`docs/`](docs/index.md).
 │                       Kubernetes API                          │
 │                                                               │
 │  SubjectAccessReview    Namespaces       MLflowConfig CRD     │
-│  (authorization)        (workspaces)     (artifact overrides) │
-│                                          Secrets              │
+│  (authorization)        (workspaces)     (artifact/archive    │
+│                                          overrides) Secrets   │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,7 +54,8 @@ virtual resources and issuing SubjectAccessReviews.
 ### MLflowConfig CRD
 
 A namespace-scoped CRD (`api/mlflowconfig/v1/`, `config/crd/bases/`) that lets namespace owners
-override default artifact storage locations.
+override default artifact storage locations and, on MLflow `3.13+`, trace archival root and
+retention settings.
 
 For detailed configuration, request flow, and RBAC setup, see the [`docs/`](docs/index.md)
 directory.

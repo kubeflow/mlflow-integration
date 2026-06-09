@@ -6,7 +6,11 @@ Both plugins talk to the Kubernetes API, but they need different permissions dep
 
 The workspace provider needs to list and watch namespaces. If you use the optional `MLflowConfig` CRD for artifact overrides, the server also needs access to that CRD and to list/watch the shared `mlflow-artifact-connection` secret across namespaces.
 
-The provider watches only that secret name by using a `metadata.name=mlflow-artifact-connection` field selector. On Kubernetes 1.27+ the apiserver passes that field selector through authorization, so the RBAC rule can stay scoped with `resourceNames: ["mlflow-artifact-connection"]`.
+If you also use workspace trace archival overrides on MLflow `3.13+`, the server needs the same list/watch access for the fixed `mlflow-archive-secret` contract as well.
+
+The provider watches only those secret names by using `metadata.name=<secret-name>` field selectors. On Kubernetes 1.27+ the apiserver passes that field selector through authorization, so the RBAC rule can stay scoped with:
+
+- `resourceNames: ["mlflow-artifact-connection", "mlflow-archive-secret"]`
 
 Reusable example:
 

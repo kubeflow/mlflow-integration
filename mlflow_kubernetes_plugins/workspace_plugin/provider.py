@@ -4,14 +4,15 @@ import logging
 import os
 import posixpath
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 from kubernetes import client, config
 from kubernetes.client import CoreV1Api, CustomObjectsApi
 from kubernetes.config.config_exception import ConfigException
-from mlflow.entities.workspace import Workspace
+from mlflow.entities.workspace import Workspace, WorkspaceDeletionMode
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.protos.databricks_pb2 import (
@@ -22,7 +23,11 @@ from mlflow.protos.databricks_pb2 import (
 from mlflow.store.workspace.abstract_store import AbstractStore
 from mlflow.utils.uri import append_to_uri_path
 
+from mlflow_kubernetes_plugins.workspace_plugin._compat import (
+    HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE,
+)
 from mlflow_kubernetes_plugins.workspace_plugin.caches import (
+    ARCHIVE_CONNECTION_SECRET_NAME,
     ARTIFACT_CONNECTION_SECRET_NAME,
     MlflowConfigCache,
     NamespaceCache,
@@ -66,6 +71,31 @@ def _merge_globs(
             seen.add(pattern)
 
     return tuple(merged)
+
+
+class WorkspaceURIOptions(TypedDict):
+    label_selector: str | None
+    default_workspace: str | None
+    namespace_exclude_globs: tuple[str, ...] | None
+
+
+def _build_workspace(
+    *,
+    name: str,
+    description: str | None,
+    default_artifact_root: str | None,
+    trace_archival_location: str | None = None,
+    trace_archival_retention: str | None = None,
+) -> Workspace:
+    kwargs: dict[str, str | None] = {
+        "name": name,
+        "description": description,
+        "default_artifact_root": default_artifact_root,
+    }
+    if HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE:
+        kwargs["trace_archival_location"] = trace_archival_location
+        kwargs["trace_archival_retention"] = trace_archival_retention
+    return Workspace(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +154,8 @@ class KubernetesWorkspaceProvider(AbstractStore):
         self._core_api, self._custom_api = self._create_api_clients()
         self._secret_cache: SecretCache | None = None
         self._secret_cache_lock = threading.Lock()
+        self._archive_secret_cache: SecretCache | None = None
+        self._archive_secret_cache_lock = threading.Lock()
         self._namespace_cache = NamespaceCache(
             self._core_api,
             self._config.label_selector,
@@ -132,15 +164,24 @@ class KubernetesWorkspaceProvider(AbstractStore):
         self._mlflow_config_cache = MlflowConfigCache(
             self._custom_api,
             ensure_artifact_connection_secret_cache=self._ensure_secret_cache,
+            ensure_archive_connection_secret_cache=(
+                self._ensure_archive_secret_cache
+                if HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE
+                else None
+            ),
         )
 
     def list_workspaces(self) -> Iterable[Workspace]:  # type: ignore[override]
         infos = self._namespace_cache.list_namespaces()
         return [
-            Workspace(
+            _build_workspace(
                 name=info.name,
                 description=info.description,
                 default_artifact_root=self._resolve_workspace_artifact_root(info.name),
+                trace_archival_location=self._resolve_workspace_trace_archival_location(info.name),
+                trace_archival_retention=self._resolve_workspace_trace_archival_retention(
+                    info.name
+                ),
             )
             for info in infos
         ]
@@ -159,10 +200,12 @@ class KubernetesWorkspaceProvider(AbstractStore):
                 )
             raise MlflowException(" ".join(parts), RESOURCE_DOES_NOT_EXIST)
 
-        return Workspace(
+        return _build_workspace(
             name=info.name,
             description=info.description,
             default_artifact_root=self._resolve_workspace_artifact_root(info.name),
+            trace_archival_location=self._resolve_workspace_trace_archival_location(info.name),
+            trace_archival_retention=self._resolve_workspace_trace_archival_retention(info.name),
         )
 
     def create_workspace(self, workspace: Workspace) -> Workspace:  # type: ignore[override]
@@ -171,7 +214,12 @@ class KubernetesWorkspaceProvider(AbstractStore):
     def update_workspace(self, workspace: Workspace) -> Workspace:  # type: ignore[override]
         raise NotImplementedError("Namespace updates are not supported by this provider")
 
-    def delete_workspace(self, workspace_name: str) -> None:  # type: ignore[override]
+    def delete_workspace(
+        self,
+        workspace_name: str,
+        mode: WorkspaceDeletionMode = WorkspaceDeletionMode.RESTRICT,
+    ) -> None:  # type: ignore[override]
+        del mode
         raise NotImplementedError("Namespace deletion is not supported by this provider")
 
     def get_default_workspace(self) -> Workspace:  # type: ignore[override]
@@ -199,6 +247,64 @@ class KubernetesWorkspaceProvider(AbstractStore):
             return None
         return root
 
+    def _resolve_workspace_trace_archival_location(self, workspace_name: str) -> str | None:
+        """Best-effort resolution of the per-workspace archive root override."""
+        if not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE:
+            return None
+
+        mlflow_config = self._mlflow_config_cache.get_config(workspace_name)
+        if not mlflow_config or (
+            not mlflow_config.archive_root_secret and not mlflow_config.archive_root_path
+        ):
+            return None
+
+        try:
+            return self._resolve_secret_backed_root(
+                workspace_name=workspace_name,
+                configured_secret=mlflow_config.archive_root_secret,
+                configured_path=mlflow_config.archive_root_path,
+                supported_secret_name=ARCHIVE_CONNECTION_SECRET_NAME,
+                path_field_name="archiveRootPath",
+                secret_field_name="archiveRootSecret",
+                location_kind="trace archival",
+                secret_cache_factory=self._ensure_archive_secret_cache,
+            )
+        except MlflowException as exc:
+            if exc.error_code == databricks_pb2.ErrorCode.Name(INVALID_PARAMETER_VALUE):
+                _logger.warning(
+                    "Trace archival configuration error for workspace '%s': %s",
+                    workspace_name,
+                    exc,
+                )
+                return None
+            raise
+
+    def _resolve_workspace_trace_archival_retention(self, workspace_name: str) -> str | None:
+        """Best-effort resolution of the per-workspace archive retention override."""
+        if not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE:
+            return None
+
+        mlflow_config = self._mlflow_config_cache.get_config(workspace_name)
+        if not mlflow_config or mlflow_config.trace_archival_retention is None:
+            return None
+
+        from mlflow.utils.validation import _validate_trace_archival_retention_string
+
+        try:
+            return _validate_trace_archival_retention_string(
+                mlflow_config.trace_archival_retention,
+                parameter_name="traceArchivalRetention",
+            )
+        except MlflowException as exc:
+            if exc.error_code == databricks_pb2.ErrorCode.Name(INVALID_PARAMETER_VALUE):
+                _logger.warning(
+                    "Trace archival retention configuration error for workspace '%s': %s",
+                    workspace_name,
+                    exc,
+                )
+                return None
+            raise
+
     def resolve_artifact_root(
         self, default_artifact_root: str | None, workspace_name: str
     ) -> tuple[str | None, bool]:
@@ -220,41 +326,140 @@ class KubernetesWorkspaceProvider(AbstractStore):
             # No override configured - use default behavior
             return default_artifact_root, True
 
-        if mlflow_config.artifact_root_secret != ARTIFACT_CONNECTION_SECRET_NAME:
+        return (
+            self._resolve_secret_backed_root(
+                workspace_name=workspace_name,
+                configured_secret=mlflow_config.artifact_root_secret,
+                configured_path=mlflow_config.artifact_root_path,
+                supported_secret_name=ARTIFACT_CONNECTION_SECRET_NAME,
+                path_field_name="artifactRootPath",
+                secret_field_name="artifactRootSecret",
+                location_kind="artifact storage",
+                secret_cache_factory=self._ensure_secret_cache,
+            ),
+            False,
+        )
+
+    def resolve_trace_archival_config(
+        self,
+        default_trace_archival_root: str,
+        default_retention: str,
+        workspace_name: str,
+    ):
+        if not HAS_MLFLOW_3_13_TRACE_ARCHIVAL_SURFACE:
+            raise NotImplementedError("Trace archival workspace overrides require MLflow 3.13+.")
+
+        from mlflow.entities.workspace import TraceArchivalConfig
+        from mlflow.store.workspace.abstract_store import ResolvedTraceArchivalConfig
+        from mlflow.utils.validation import _validate_trace_archival_retention_string
+
+        resolved_root = default_trace_archival_root
+        resolved_retention = default_retention
+        append_workspace_prefix = True
+
+        if workspace_name:
+            mlflow_config = self._mlflow_config_cache.get_config(workspace_name)
+            if mlflow_config:
+                if mlflow_config.archive_root_secret or mlflow_config.archive_root_path:
+                    resolved_root = self._resolve_secret_backed_root(
+                        workspace_name=workspace_name,
+                        configured_secret=mlflow_config.archive_root_secret,
+                        configured_path=mlflow_config.archive_root_path,
+                        supported_secret_name=ARCHIVE_CONNECTION_SECRET_NAME,
+                        path_field_name="archiveRootPath",
+                        secret_field_name="archiveRootSecret",
+                        location_kind="trace archival",
+                        secret_cache_factory=self._ensure_archive_secret_cache,
+                    )
+                    append_workspace_prefix = False
+                if mlflow_config.trace_archival_retention is not None:
+                    resolved_retention = _validate_trace_archival_retention_string(
+                        mlflow_config.trace_archival_retention,
+                        parameter_name="traceArchivalRetention",
+                    )
+
+        return ResolvedTraceArchivalConfig(
+            config=TraceArchivalConfig(
+                location=resolved_root,
+                retention=resolved_retention,
+            ),
+            append_workspace_prefix=append_workspace_prefix,
+        )
+
+    def _resolve_secret_backed_root(
+        self,
+        *,
+        workspace_name: str,
+        configured_secret: str | None,
+        configured_path: str | None,
+        supported_secret_name: str,
+        path_field_name: str,
+        secret_field_name: str,
+        location_kind: str,
+        secret_cache_factory: Callable[[], SecretCache],
+    ) -> str:
+        if not configured_secret:
+            if configured_path:
+                raise MlflowException(
+                    f"MLflowConfig in namespace '{workspace_name}' sets {path_field_name} "
+                    f"without {secret_field_name}.",
+                    INVALID_PARAMETER_VALUE,
+                )
             raise MlflowException(
-                f"MLflowConfig in namespace '{workspace_name}' sets artifactRootSecret to "
-                f"'{mlflow_config.artifact_root_secret}', but only "
-                f"'{ARTIFACT_CONNECTION_SECRET_NAME}' is supported.",
+                f"MLflowConfig in namespace '{workspace_name}' is missing {secret_field_name}.",
                 INVALID_PARAMETER_VALUE,
             )
 
-        secret_info = self._ensure_secret_cache().get_secret(workspace_name)
+        if configured_secret != supported_secret_name:
+            raise MlflowException(
+                f"MLflowConfig in namespace '{workspace_name}' sets {secret_field_name} to "
+                f"'{configured_secret}', but only '{supported_secret_name}' is supported.",
+                INVALID_PARAMETER_VALUE,
+            )
+
+        secret_cache = secret_cache_factory()
+        secret_info = secret_cache.get_secret(workspace_name)
         bucket_uri = secret_info.bucket_uri if secret_info else None
 
         if not bucket_uri:
             raise MlflowException(
-                f"Invalid artifact storage configuration in namespace '{workspace_name}'. "
-                f"Secret '{ARTIFACT_CONNECTION_SECRET_NAME}' does not exist or is missing "
-                "the 'AWS_S3_BUCKET' key.",
+                f"Invalid {location_kind} configuration in namespace '{workspace_name}'. "
+                f"Secret '{supported_secret_name}' does not exist or is missing the "
+                "'AWS_S3_BUCKET' key.",
                 INVALID_PARAMETER_VALUE,
             )
 
-        # If artifactRootPath is set, validate and append it to the bucket URI
-        if mlflow_config.artifact_root_path:
-            path = mlflow_config.artifact_root_path.strip()
-
-            # Validate the path
+        if configured_path:
+            path = configured_path.strip()
             if not path:
                 _logger.debug(
-                    "MLflowConfig in namespace '%s' has empty artifactRootPath. Using bucket root.",
+                    "MLflowConfig in namespace '%s' has empty %s. Using bucket root.",
                     workspace_name,
+                    path_field_name,
                 )
-            elif validated_path := self._validate_artifact_path(path, workspace_name):
+            elif validated_path := self._validate_relative_path(
+                path,
+                workspace_name,
+                path_field_name,
+            ):
                 bucket_uri = append_to_uri_path(bucket_uri, validated_path)
 
-        return bucket_uri, False
+        return bucket_uri
 
-    def _validate_artifact_path(self, path: str, workspace_name: str) -> str | None:
+    def _validate_artifact_path(
+        self,
+        path: str,
+        workspace_name: str,
+        field_name: str = "artifactRootPath",
+    ) -> str | None:
+        return self._validate_relative_path(path, workspace_name, field_name)
+
+    def _validate_relative_path(
+        self,
+        path: str,
+        workspace_name: str,
+        field_name: str,
+    ) -> str | None:
         """
         Validate and normalize an artifact path.
 
@@ -271,7 +476,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
         # Reject backslashes
         if "\\" in path:
             raise MlflowException(
-                f"Invalid artifactRootPath '{path}' in MLflowConfig for namespace "
+                f"Invalid {field_name} '{path}' in MLflowConfig for namespace "
                 f"'{workspace_name}'. Backslashes are not allowed; use forward slashes.",
                 INVALID_PARAMETER_VALUE,
             )
@@ -282,7 +487,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
         # Reject absolute paths
         if normalized.startswith("/"):
             raise MlflowException(
-                f"Invalid artifactRootPath '{path}' in MLflowConfig for namespace "
+                f"Invalid {field_name} '{path}' in MLflowConfig for namespace "
                 f"'{workspace_name}'. Absolute paths are not allowed.",
                 INVALID_PARAMETER_VALUE,
             )
@@ -290,7 +495,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
         # This catches cases like "../foo" that normalize but still traverse up
         if normalized == ".." or normalized.startswith("../") or "/../" in normalized:
             raise MlflowException(
-                f"Invalid artifactRootPath '{path}' in MLflowConfig for namespace "
+                f"Invalid {field_name} '{path}' in MLflowConfig for namespace "
                 f"'{workspace_name}'. Path traversal ('..') is not allowed.",
                 INVALID_PARAMETER_VALUE,
             )
@@ -309,8 +514,30 @@ class KubernetesWorkspaceProvider(AbstractStore):
         with self._secret_cache_lock:
             cache = self._secret_cache
             if cache is None:
-                cache = SecretCache(self._core_api)
+                cache = SecretCache(
+                    self._core_api,
+                    ARTIFACT_CONNECTION_SECRET_NAME,
+                    "artifact root",
+                )
                 self._secret_cache = cache
+
+        return cache
+
+    def _ensure_archive_secret_cache(self) -> SecretCache:
+        """Create the shared archive SecretCache once, then reuse it."""
+        cache = self._archive_secret_cache
+        if cache is not None:
+            return cache
+
+        with self._archive_secret_cache_lock:
+            cache = self._archive_secret_cache
+            if cache is None:
+                cache = SecretCache(
+                    self._core_api,
+                    ARCHIVE_CONNECTION_SECRET_NAME,
+                    "trace archival root",
+                )
+                self._archive_secret_cache = cache
 
         return cache
 
@@ -332,7 +559,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
 
 def _parse_workspace_uri_options(
     workspace_uri: str | None,
-) -> dict[str, str | tuple[str, ...] | None]:
+) -> WorkspaceURIOptions:
     """
     Parse query parameters from the workspace URI to configure the provider.
     Supported parameters:
@@ -342,7 +569,11 @@ def _parse_workspace_uri_options(
     """
 
     if not workspace_uri:
-        return {}
+        return {
+            "label_selector": None,
+            "default_workspace": None,
+            "namespace_exclude_globs": None,
+        }
 
     parsed = urlparse(workspace_uri)
     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -355,9 +586,10 @@ def _parse_workspace_uri_options(
         value = value.strip()
         return value or None
 
-    options: dict[str, str | tuple[str, ...] | None] = {
+    options: WorkspaceURIOptions = {
         "label_selector": _get_param("label_selector"),
         "default_workspace": _get_param("default_workspace"),
+        "namespace_exclude_globs": None,
     }
 
     exclude_param = _get_param("namespace_exclude_globs")

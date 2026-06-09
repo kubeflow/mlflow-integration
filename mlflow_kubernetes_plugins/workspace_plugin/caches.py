@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+from typing import Any, cast
 
 from kubernetes import watch
 from kubernetes.client import CoreV1Api, CustomObjectsApi
@@ -25,6 +26,7 @@ MLFLOW_CONFIG_VERSION = "v1"
 MLFLOW_CONFIG_PLURAL = "mlflowconfigs"
 
 ARTIFACT_CONNECTION_SECRET_NAME = "mlflow-artifact-connection"
+ARCHIVE_CONNECTION_SECRET_NAME = "mlflow-archive-secret"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,9 @@ class MlflowConfigInfo:
     namespace: str
     artifact_root_path: str | None
     artifact_root_secret: str | None
+    archive_root_path: str | None
+    archive_root_secret: str | None
+    trace_archival_retention: str | None
 
 
 class NamespaceCache:
@@ -215,9 +220,11 @@ class MlflowConfigCache:
         self,
         api: CustomObjectsApi,
         ensure_artifact_connection_secret_cache: Callable[[], "SecretCache"] | None = None,
+        ensure_archive_connection_secret_cache: Callable[[], "SecretCache"] | None = None,
     ):
         self._api = api
         self._ensure_artifact_connection_secret_cache = ensure_artifact_connection_secret_cache
+        self._ensure_archive_connection_secret_cache = ensure_archive_connection_secret_cache
         self._lock = threading.RLock()
         self._configs: dict[str, MlflowConfigInfo] = {}
         self._resource_version: str | None = None
@@ -310,22 +317,30 @@ class MlflowConfigCache:
         items = response.get("items", [])
         metadata = response.get("metadata", {})
         resource_version = metadata.get("resourceVersion")
-        should_ensure_secret_cache = False
+        should_ensure_artifact_secret_cache = False
+        should_ensure_archive_secret_cache = False
 
         with self._lock:
             self._configs = {}
             for item in items:
                 if info := self._extract_info(item):
                     self._configs[info.namespace] = info
-                    should_ensure_secret_cache = (
-                        should_ensure_secret_cache or self._uses_artifact_connection_secret(info)
+                    should_ensure_artifact_secret_cache = (
+                        should_ensure_artifact_secret_cache
+                        or self._uses_artifact_connection_secret(info)
+                    )
+                    should_ensure_archive_secret_cache = (
+                        should_ensure_archive_secret_cache
+                        or self._uses_archive_connection_secret(info)
                     )
             self._resource_version = resource_version
             self._crd_available = True
             self._crd_missing_logged = False
 
-        if should_ensure_secret_cache:
+        if should_ensure_artifact_secret_cache:
             self._ensure_secret_cache()
+        if should_ensure_archive_secret_cache:
+            self._ensure_archive_secret_cache()
         self._ready_event.set()
 
     def _run(self) -> None:
@@ -390,11 +405,18 @@ class MlflowConfigCache:
 
     def _handle_event(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
-        obj = event.get("object", {})
-        metadata = obj.get("metadata", {})
+        obj = event.get("object")
+        if not isinstance(obj, dict):
+            return
+        obj = cast("dict[str, Any]", obj)
+        metadata = obj.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        metadata = cast("dict[str, Any]", metadata)
         namespace = metadata.get("namespace")
         resource_version = metadata.get("resourceVersion")
-        should_ensure_secret_cache = False
+        should_ensure_artifact_secret_cache = False
+        should_ensure_archive_secret_cache = False
 
         if not namespace:
             return
@@ -403,7 +425,10 @@ class MlflowConfigCache:
             if event_type in {"ADDED", "MODIFIED"}:
                 if info := self._extract_info(obj):
                     self._configs[namespace] = info
-                    should_ensure_secret_cache = self._uses_artifact_connection_secret(info)
+                    should_ensure_artifact_secret_cache = self._uses_artifact_connection_secret(
+                        info
+                    )
+                    should_ensure_archive_secret_cache = self._uses_archive_connection_secret(info)
                 self._resource_version = resource_version
             elif event_type == "DELETED":
                 self._configs.pop(namespace, None)
@@ -416,30 +441,50 @@ class MlflowConfigCache:
                 # Unknown event type; trigger a resync.
                 self._resource_version = None
 
-        if should_ensure_secret_cache:
+        if should_ensure_artifact_secret_cache:
             self._ensure_secret_cache()
+        if should_ensure_archive_secret_cache:
+            self._ensure_archive_secret_cache()
 
-    def _extract_info(self, obj: dict[str, object]) -> MlflowConfigInfo | None:
+    def _extract_info(self, obj: dict[str, Any]) -> MlflowConfigInfo | None:
         metadata = obj.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return None
+        metadata = cast("dict[str, Any]", metadata)
         namespace = metadata.get("namespace")
         if not namespace:
             return None
 
-        spec = obj.get("spec") or {}
+        spec = obj.get("spec")
+        if not isinstance(spec, dict):
+            spec = {}
+        spec = cast("dict[str, Any]", spec)
         return MlflowConfigInfo(
             namespace=namespace,
             artifact_root_path=spec.get("artifactRootPath"),
             artifact_root_secret=spec.get("artifactRootSecret"),
+            archive_root_path=spec.get("archiveRootPath"),
+            archive_root_secret=spec.get("archiveRootSecret"),
+            trace_archival_retention=spec.get("traceArchivalRetention"),
         )
 
     @staticmethod
     def _uses_artifact_connection_secret(info: MlflowConfigInfo) -> bool:
         return info.artifact_root_secret == ARTIFACT_CONNECTION_SECRET_NAME
 
+    @staticmethod
+    def _uses_archive_connection_secret(info: MlflowConfigInfo) -> bool:
+        return info.archive_root_secret == ARCHIVE_CONNECTION_SECRET_NAME
+
     def _ensure_secret_cache(self) -> None:
         """Ask the owner to ensure the shared SecretCache is running."""
         if self._ensure_artifact_connection_secret_cache is not None:
             self._ensure_artifact_connection_secret_cache()
+
+    def _ensure_archive_secret_cache(self) -> None:
+        """Ask the owner to ensure the shared archive SecretCache is running."""
+        if self._ensure_archive_connection_secret_cache is not None:
+            self._ensure_archive_connection_secret_cache()
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,10 +494,17 @@ class SecretInfo:
 
 
 class SecretCache:
-    """Caches the shared artifact-connection Secret across namespaces."""
+    """Caches a fixed shared Secret contract across namespaces."""
 
-    def __init__(self, api: CoreV1Api):
+    def __init__(
+        self,
+        api: CoreV1Api,
+        secret_name: str = ARTIFACT_CONNECTION_SECRET_NAME,
+        override_label: str = "artifact root",
+    ):
         self._api = api
+        self._secret_name = secret_name
+        self._override_label = override_label
         self._lock = threading.RLock()
         self._secrets: dict[str, SecretInfo] = {}
         self._resource_version: str | None = None
@@ -493,16 +545,17 @@ class SecretCache:
     def _refresh_full(self) -> None:
         try:
             response = self._api.list_secret_for_all_namespaces(
-                field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
+                field_selector=f"metadata.name={self._secret_name}",
                 watch=False,
             )
         except ApiException as exc:
             if exc.status == 403:
                 _logger.warning(
                     "Permission denied listing secrets. Ensure RBAC allows 'list' and 'watch' "
-                    "on secrets with resourceNames ['%s']. Per-namespace artifact root "
+                    "on secrets with resourceNames ['%s']. Per-namespace %s "
                     "overrides will be unavailable until this is resolved.",
-                    ARTIFACT_CONNECTION_SECRET_NAME,
+                    self._secret_name,
+                    self._override_label,
                 )
                 with self._lock:
                     self._available = False
@@ -558,7 +611,7 @@ class SecretCache:
             try:
                 for event in watcher.stream(
                     self._api.list_secret_for_all_namespaces,
-                    field_selector=f"metadata.name={ARTIFACT_CONNECTION_SECRET_NAME}",
+                    field_selector=f"metadata.name={self._secret_name}",
                     resource_version=self._resource_version,
                     timeout_seconds=300,
                 ):
@@ -629,8 +682,7 @@ class SecretCache:
         bucket_uri = self._decode_bucket_uri(data, namespace)
         return SecretInfo(namespace=namespace, bucket_uri=bucket_uri)
 
-    @staticmethod
-    def _decode_bucket_uri(data: dict[str, str], namespace: str) -> str | None:
+    def _decode_bucket_uri(self, data: dict[str, str], namespace: str) -> str | None:
         raw = data.get("AWS_S3_BUCKET")
         if not raw:
             return None
@@ -639,7 +691,7 @@ class SecretCache:
         except (binascii.Error, UnicodeDecodeError):
             _logger.warning(
                 "Invalid base64 data for AWS_S3_BUCKET in secret '%s' (namespace '%s')",
-                ARTIFACT_CONNECTION_SECRET_NAME,
+                self._secret_name,
                 namespace,
             )
             return None
@@ -648,6 +700,7 @@ class SecretCache:
 
 __all__ = [
     "ARTIFACT_CONNECTION_SECRET_NAME",
+    "ARCHIVE_CONNECTION_SECRET_NAME",
     "DEFAULT_DESCRIPTION_ANNOTATION",
     "MLFLOW_CONFIG_GROUP",
     "MLFLOW_CONFIG_PLURAL",
