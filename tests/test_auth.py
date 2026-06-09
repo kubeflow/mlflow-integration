@@ -1823,6 +1823,22 @@ def test_resolve_resource_names_delete_json_body_does_not_fallback_to_query_para
         )
 
 
+def test_parse_experiment_id_to_name_treats_blank_value_as_missing_reference():
+    with pytest.raises(resource_names_mod.ResourceReferenceNotPresentError):
+        resource_names_mod._parse_experiment_id_to_name(
+            AuthorizationRequest(
+                authorization_header=None,
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/ajax-api/3.0/mlflow/scorers/list",
+                method="GET",
+                workspace="team-a",
+                query_params={"experiment_id": ""},
+            )
+        )
+
+
 def test_resolve_resource_names_resolves_dataset_id_to_name(monkeypatch):
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
@@ -3989,6 +4005,41 @@ def test_apply_response_collection_filters_filters_scorers(monkeypatch):
     assert filtered == {"scorers": [{"experiment_id": "1", "scorer_name": "alpha"}]}
 
 
+def test_apply_response_collection_filters_filters_scorers_with_numeric_experiment_ids(
+    monkeypatch,
+):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a"
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
+    )
+
+    filtered, enforceable = apply_response_collection_filters(
+        {
+            "scorers": [
+                {"experiment_id": 1, "scorer_name": "alpha"},
+                {"experiment_id": 2, "scorer_name": "beta"},
+            ]
+        },
+        [
+            AuthorizationRule(
+                "get",
+                resource=RESOURCE_EXPERIMENTS,
+                collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+            )
+        ],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert enforceable is True
+    assert filtered == {"scorers": [{"experiment_id": 1, "scorer_name": "alpha"}]}
+
+
 def test_apply_response_collection_filters_not_enforceable_on_unexpected_shape():
     authorizer = Mock()
     authorizer.is_allowed.return_value = False
@@ -4405,6 +4456,17 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
     ):
         rule = PATH_AUTHORIZATION_RULES[route]
         assert rule.resource_name_parsers == (RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,)
+
+
+def test_assistant_provider_models_route_uses_assistants_resource():
+    rule = PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/providers/<provider>/models", "GET")
+    ]
+    assert (rule.verb, rule.resource, rule.subresource) == (
+        "get",
+        RESOURCE_ASSISTANTS,
+        None,
+    )
 
 
 def test_resolve_resource_names_reads_gateway_endpoint_name_from_model_field():

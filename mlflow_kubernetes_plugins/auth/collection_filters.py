@@ -123,6 +123,14 @@ def _first_present_value(mapping: dict[str, object], *candidate_keys: str) -> ob
     return None
 
 
+def _normalize_string_or_int(value: object) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    return _normalize_string(value)
+
+
 def _can_read_experiment_id(
     authorizer: "KubernetesAuthorizer",
     identity: "_RequestIdentity",
@@ -540,7 +548,7 @@ def _filter_payload_scorers(
     for scorer in scorers:
         if not isinstance(scorer, dict):
             continue
-        experiment_id = _normalize_string(
+        experiment_id = _normalize_string_or_int(
             _first_present_value(scorer, "experiment_id", "experimentId")
         )
         if experiment_id is None:

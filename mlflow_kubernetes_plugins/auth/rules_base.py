@@ -812,6 +812,9 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
     ("/gateway/anthropic/v1/messages", "POST"): _gateway_endpoints_use_rule(
         resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
     ),
+    ("/gateway/proxy/<endpoint_name>/<path:path>", "POST"): _gateway_endpoints_use_rule(
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    ),
     (
         "/gateway/gemini/v1beta/models/<endpoint_name>:generateContent",
         "POST",
@@ -929,6 +932,10 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
     ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>", "PATCH"): _assistants_rule("update"),
     (
         "/ajax-api/3.0/mlflow/assistant/providers/<provider>/health",
+        "GET",
+    ): _assistants_rule("get"),
+    (
+        "/ajax-api/3.0/mlflow/assistant/providers/<provider>/models",
         "GET",
     ): _assistants_rule("get"),
     ("/ajax-api/3.0/mlflow/assistant/config", "GET"): _assistants_rule("get"),

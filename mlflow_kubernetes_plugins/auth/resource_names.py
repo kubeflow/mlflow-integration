@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from mlflow.exceptions import MlflowException
@@ -62,6 +63,13 @@ class ResourceNameResolutionError(RuntimeError):
 
 class ResourceReferenceNotPresentError(ResourceNameResolutionError):
     """Raised when an optional resource reference is absent from the request."""
+
+
+@dataclass(frozen=True)
+class _OptionalRequestParamResult:
+    value: str | None
+    is_present: bool
+    is_explicitly_empty: bool
 
 
 class _NameLookupCache:
@@ -195,7 +203,19 @@ def _get_request_param_values(request_context: AuthorizationRequest, param: str)
     return values
 
 
-def _get_optional_request_param(request_context: AuthorizationRequest, param: str) -> str | None:
+def _is_explicit_empty_request_param_value(raw_value: object) -> bool:
+    if isinstance(raw_value, str):
+        return raw_value == ""
+    return (
+        isinstance(raw_value, list)
+        and bool(raw_value)
+        and all(isinstance(item, str) and item == "" for item in raw_value)
+    )
+
+
+def _get_optional_request_param_result(
+    request_context: AuthorizationRequest, param: str
+) -> _OptionalRequestParamResult:
     method = (request_context.method or "").upper()
     has_json_body = isinstance(request_context.json_body, dict)
     body = request_context.json_body if has_json_body else {}
@@ -218,29 +238,37 @@ def _get_optional_request_param(request_context: AuthorizationRequest, param: st
         value = _get_single_value(request_context.path_params, param)
 
     if value is None and param == "run_id":
-        return _get_optional_request_param(request_context, "run_uuid")
-    return value
+        run_uuid_result = _get_optional_request_param_result(request_context, "run_uuid")
+        if run_uuid_result.value is not None:
+            return _OptionalRequestParamResult(
+                value=run_uuid_result.value,
+                is_present=run_uuid_result.is_present,
+                is_explicitly_empty=run_uuid_result.is_explicitly_empty,
+            )
 
-
-def _has_explicit_empty_request_param(request_context: AuthorizationRequest, param: str) -> bool:
-    """Return True when the request mentions *param* with an explicitly empty string value."""
+    is_present = False
+    is_explicitly_empty = False
     for mapping in (
         request_context.path_params,
         request_context.query_params,
-        request_context.json_body if isinstance(request_context.json_body, dict) else None,
+        body if has_json_body else None,
     ):
         if not isinstance(mapping, dict) or param not in mapping:
             continue
-        raw_value = mapping.get(param)
-        if isinstance(raw_value, str) and raw_value == "":
-            return True
-        if (
-            isinstance(raw_value, list)
-            and raw_value
-            and all(isinstance(item, str) and item == "" for item in raw_value)
-        ):
-            return True
-    return False
+        is_present = True
+        is_explicitly_empty = is_explicitly_empty or _is_explicit_empty_request_param_value(
+            mapping.get(param)
+        )
+
+    return _OptionalRequestParamResult(
+        value=value,
+        is_present=is_present,
+        is_explicitly_empty=is_explicitly_empty,
+    )
+
+
+def _get_optional_request_param(request_context: AuthorizationRequest, param: str) -> str | None:
+    return _get_optional_request_param_result(request_context, param).value
 
 
 def _get_header(request_context: AuthorizationRequest, header_name: str) -> str | None:
@@ -471,20 +499,14 @@ def _parse_experiment_id_to_name(request_context: AuthorizationRequest) -> tuple
        Raise ``ResourceNameResolutionError`` so callers keep the older
        fail-closed behavior for malformed targeted requests.
     """
-    experiment_id = _get_optional_request_param(request_context, "experiment_id")
+    experiment_id_result = _get_optional_request_param_result(request_context, "experiment_id")
+    experiment_id = experiment_id_result.value
     if experiment_id is None:
-        if _has_explicit_empty_request_param(request_context, "experiment_id"):
+        if experiment_id_result.is_explicitly_empty:
             raise ResourceReferenceNotPresentError(
                 "Request did not provide a usable experiment_id reference."
             )
-        if (
-            "experiment_id" in request_context.path_params
-            or "experiment_id" in request_context.query_params
-            or (
-                isinstance(request_context.json_body, dict)
-                and "experiment_id" in request_context.json_body
-            )
-        ):
+        if experiment_id_result.is_present:
             raise ResourceNameResolutionError(
                 "Missing required parameter 'experiment_id' for authorization."
             )

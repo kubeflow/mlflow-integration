@@ -703,14 +703,14 @@ async def _authorize_request_async(
                     "is missing an RBAC resource mapping.",
                     error_code=databricks_pb2.INTERNAL_ERROR,
                 )
-            allowed = authorizer.is_allowed(
+            has_permission = authorizer.is_allowed(
                 identity,
                 rule.resource,
                 rule.verb,
                 workspace_name,
                 rule.subresource,
             )
-            broad_allowed = allowed
+            has_broad_permission = has_permission
             response_or_graphql_filter_policy = is_response_filter_policy(
                 rule.collection_policy
             ) or is_graphql_collection_policy(rule.collection_policy)
@@ -723,7 +723,7 @@ async def _authorize_request_async(
             # This approach allows us to reuse cache SelfSubjectAccessReview of the common case
             # where a user has access to all resources to the workspace.
             resource_reference_missing = False
-            if not allowed and rule.resource_name_parsers:
+            if not has_permission and rule.resource_name_parsers:
                 updated_request_context = await _ensure_request_context_json_body(
                     updated_request_context
                 )
@@ -738,7 +738,7 @@ async def _authorize_request_async(
                     resource_names = ()
                 except ResourceNameResolutionError:
                     resource_names = ()
-                allowed = bool(resource_names) and all(
+                has_permission = bool(resource_names) and all(
                     authorizer.is_allowed(
                         identity,
                         rule.resource,
@@ -755,7 +755,7 @@ async def _authorize_request_async(
             # already covers every returned row, but the auth core still needs to classify the
             # request shape correctly here.
             response_filter_on_missing_reference = (
-                broad_allowed and hybrid_missing_reference_filter_rule
+                has_broad_permission and hybrid_missing_reference_filter_rule
             )
             if response_filter_on_missing_reference:
                 updated_request_context = await _ensure_request_context_json_body(
@@ -768,7 +768,7 @@ async def _authorize_request_async(
                     response_filter_required = True
                 except ResourceNameResolutionError:
                     pass
-            if not allowed and rule.collection_policy:
+            if not has_permission and rule.collection_policy:
                 updated_request_context, request_filter_applied = apply_request_collection_filter(
                     updated_request_context,
                     rule.collection_policy,
@@ -790,12 +790,12 @@ async def _authorize_request_async(
                         )
                     )
                 if request_filter_applied:
-                    allowed = True
+                    has_permission = True
                 elif response_or_graphql_filter_policy:
                     if not hybrid_missing_reference_filter_rule or resource_reference_missing:
                         response_filter_required = True
-                        allowed = True
-            if not allowed:
+                        has_permission = True
+            if not has_permission:
                 raise MlflowException(
                     "Permission denied for requested operation.",
                     error_code=databricks_pb2.PERMISSION_DENIED,
