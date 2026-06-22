@@ -62,6 +62,30 @@ _GRAPHQL_AUTHORIZER: ContextVar[KubernetesAuthorizer | None] = ContextVar(
 )
 
 
+_POD_NAMESPACE: str | None = None
+_POD_NAMESPACE_RESOLVED = False
+
+
+def _get_pod_namespace() -> str | None:
+    """Return the Kubernetes namespace this pod is running in.
+
+    Reads from the mounted service account token; cached after first call
+    (including negative results to avoid repeated syscalls).
+    Returns ``None`` outside a Kubernetes pod.
+    """
+    global _POD_NAMESPACE, _POD_NAMESPACE_RESOLVED
+    if _POD_NAMESPACE_RESOLVED:
+        return _POD_NAMESPACE
+    try:
+        with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
+            value = f.read().strip()
+            _POD_NAMESPACE = value or None
+    except OSError:
+        _POD_NAMESPACE = None
+    _POD_NAMESPACE_RESOLVED = True
+    return _POD_NAMESPACE
+
+
 def _replace_scope_headers(scope: Scope, updates: dict[str, str]) -> None:
     """Replace (or add) ASGI scope headers, matching case-insensitively."""
     encoded = {k.lower().encode("latin-1"): v.encode("latin-1") for k, v in updates.items()}
@@ -328,15 +352,24 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
                         request.headers.get(WORKSPACE_HEADER_NAME)
                     )
                 except MlflowException as exc:
-                    return JSONResponse(
-                        status_code=exc.get_http_status_code(),
-                        content=json.loads(exc.serialize_as_json()),
-                    )
+                    # When workspaces are disabled (FEATURE_DISABLED), fall back to the
+                    # pod namespace for SAR checks. This supports single-tenant deployments
+                    # that use kubernetes-auth without enabling workspaces.
+                    if exc.error_code == databricks_pb2.FEATURE_DISABLED:
+                        workspace_name = _get_pod_namespace()
+                    else:
+                        return JSONResponse(
+                            status_code=exc.get_http_status_code(),
+                            content=json.loads(exc.serialize_as_json()),
+                        )
+                else:
+                    if workspace is not None:
+                        workspace_name = workspace.name
+                        workspace_context.set_server_request_workspace(workspace_name)
+                        workspace_set = True
 
-                if workspace is not None:
-                    workspace_name = workspace.name
-                    workspace_context.set_server_request_workspace(workspace_name)
-                    workspace_set = True
+            if workspace_name is None:
+                workspace_name = _get_pod_namespace()
 
             path_params = _extract_path_params(canonical_path, request.method) or dict(
                 request.path_params
