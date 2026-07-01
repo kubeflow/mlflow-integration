@@ -785,7 +785,6 @@ def test_disabled_workspaces_use_configured_namespace_for_access_review(monkeypa
 
     call_args = authorizer.is_allowed.call_args[0]
     assert call_args[1:] == ("experiments", "list", "mlflow-system", None)
-    assert call_args[3] != "team-a"
     assert result.request_context.workspace == "mlflow-system"
 
 
