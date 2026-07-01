@@ -697,8 +697,13 @@ async def _authorize_request_async(
 
         if rule.verb is not None:
             if not workspace_name:
+                message = _WORKSPACE_REQUIRED_ERROR_MESSAGE
+                if not config_values.workspaces_enabled:
+                    message = (
+                        "Kubernetes auth namespace is required when workspaces are disabled."
+                    )
                 raise MlflowException(
-                    _WORKSPACE_REQUIRED_ERROR_MESSAGE,
+                    message,
                     error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
                 )
             if rule.resource == RESOURCE_GATEWAY_BUDGETS and rule.verb in {"create", "update"}:
