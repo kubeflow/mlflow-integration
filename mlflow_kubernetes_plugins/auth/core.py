@@ -641,11 +641,7 @@ async def _authorize_request_async(
 
     workspace_name = None
     if not config_values.workspaces_enabled:
-        workspace_name = (
-            config_values.namespace.strip()
-            if isinstance(config_values.namespace, str)
-            else None
-        )
+        workspace_name = (config_values.namespace or "").strip()
         if not workspace_name:
             raise MlflowException(
                 "Kubernetes auth namespace is required when workspaces are disabled.",
