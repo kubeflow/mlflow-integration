@@ -642,6 +642,11 @@ async def _authorize_request_async(
     workspace_name = None
     if not config_values.workspaces_enabled:
         workspace_name = config_values.namespace
+        if not workspace_name:
+            raise MlflowException(
+                "Kubernetes auth namespace is required when workspaces are disabled.",
+                error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+            )
     elif isinstance(request_context.workspace, str):
         workspace_name = request_context.workspace.strip() or None
 
@@ -652,11 +657,6 @@ async def _authorize_request_async(
         updated_request_context = replace(updated_request_context, workspace=workspace_name)
     if request_context.path.endswith("/graphql") and request_context.graphql_payload is None:
         updated_request_context = await _ensure_request_context_json_body(updated_request_context)
-    if not config_values.workspaces_enabled and not workspace_name:
-        raise MlflowException(
-            "Kubernetes auth namespace is required when workspaces are disabled.",
-            error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
-        )
 
     rules = _find_authorization_rules(
         updated_request_context.path,
@@ -701,11 +701,6 @@ async def _authorize_request_async(
             )
 
         if rule.verb is not None:
-            if config_values.workspaces_enabled and not workspace_name:
-                raise MlflowException(
-                    _WORKSPACE_REQUIRED_ERROR_MESSAGE,
-                    error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
-                )
             if rule.resource == RESOURCE_GATEWAY_BUDGETS and rule.verb in {"create", "update"}:
                 updated_request_context = await _enforce_gateway_budget_scope(
                     updated_request_context, rule

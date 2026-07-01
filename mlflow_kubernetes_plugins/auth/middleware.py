@@ -315,11 +315,12 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
             if _is_unprotected_path(canonical_path):
                 return await call_next(request)
 
-            workspace_name = self.config_values.namespace
             workspace_set = False
 
             if self.config_values.workspaces_enabled:
                 workspace_name = workspace_context.get_request_workspace()
+            else:
+                workspace_name = self.config_values.namespace
 
             if self.config_values.workspaces_enabled and workspace_name is None:
                 # FastAPI executes middlewares in reverse order, so this auth middleware can run
