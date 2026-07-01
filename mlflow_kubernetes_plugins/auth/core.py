@@ -640,12 +640,16 @@ async def _authorize_request_async(
         username = remote_user
 
     workspace_name = None
-    if isinstance(request_context.workspace, str):
+    if not config_values.workspaces_enabled:
+        workspace_name = config_values.namespace
+    elif isinstance(request_context.workspace, str):
         workspace_name = request_context.workspace.strip() or None
 
     from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
 
     updated_request_context = request_context
+    if not config_values.workspaces_enabled and workspace_name:
+        updated_request_context = replace(updated_request_context, workspace=workspace_name)
     if request_context.path.endswith("/graphql") and request_context.graphql_payload is None:
         updated_request_context = await _ensure_request_context_json_body(updated_request_context)
 
@@ -692,6 +696,11 @@ async def _authorize_request_async(
             )
 
         if rule.verb is not None:
+            if not workspace_name:
+                raise MlflowException(
+                    _WORKSPACE_REQUIRED_ERROR_MESSAGE,
+                    error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+                )
             if rule.resource == RESOURCE_GATEWAY_BUDGETS and rule.verb in {"create", "update"}:
                 updated_request_context = await _enforce_gateway_budget_scope(
                     updated_request_context, rule

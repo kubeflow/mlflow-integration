@@ -39,6 +39,8 @@ mlflow server \
 | `MLFLOW_K8S_AUTH_REMOTE_USER_HEADER` | `x-remote-user` | Username header used in trusted-proxy mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_GROUPS_HEADER` | `x-remote-groups` | Groups header used in trusted-proxy mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_GROUPS_SEPARATOR` | `\|` | Separator used to split the groups header. |
+| `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED` | `true` | Set to `false` when MLflow is started without `--enable-workspaces`. |
+| `MLFLOW_K8S_AUTH_NAMESPACE` | unset | Kubernetes namespace used for SAR/SSAR checks when workspaces are disabled. Required if `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED=false`. |
 
 ## Authorization Modes
 
@@ -71,6 +73,9 @@ For authenticated requests, clients typically need:
 
 - workspace context through `X-MLFLOW-WORKSPACE`, `mlflow.set_workspace()`, or `MLFLOW_WORKSPACE`
 - a bearer token in `Authorization: Bearer <token>` or `X-Forwarded-Access-Token`
+
+When `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED=false`, clients do not need workspace context. The
+plugin uses `MLFLOW_K8S_AUTH_NAMESPACE` as the namespace for Kubernetes access reviews instead.
 
 Example:
 

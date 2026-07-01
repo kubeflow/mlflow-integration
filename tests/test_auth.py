@@ -114,6 +114,7 @@ from mlflow_kubernetes_plugins.auth.compiler import (
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     AUTHORIZATION_MODE_ENV,
+    NAMESPACE_ENV,
     REMOTE_GROUPS_HEADER_ENV,
     REMOTE_USER_HEADER_ENV,
     RESOURCE_ASSISTANTS,
@@ -125,6 +126,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_GATEWAY_MODEL_DEFINITIONS,
     RESOURCE_GATEWAY_SECRETS,
     RESOURCE_REGISTERED_MODELS,
+    WORKSPACES_ENABLED_ENV,
 )
 from mlflow_kubernetes_plugins.auth.core import (
     _canonicalize_path,
@@ -408,6 +410,41 @@ def test_kubernetes_auth_config_empty_user_header(monkeypatch):
 def test_kubernetes_auth_config_empty_groups_header(monkeypatch):
     monkeypatch.setenv(REMOTE_GROUPS_HEADER_ENV, "")
     with pytest.raises(MlflowException, match="cannot be empty"):
+        KubernetesAuthConfig.from_env()
+
+
+def test_kubernetes_auth_config_workspaces_enabled_by_default(monkeypatch):
+    monkeypatch.delenv(WORKSPACES_ENABLED_ENV, raising=False)
+    monkeypatch.delenv(NAMESPACE_ENV, raising=False)
+
+    config = KubernetesAuthConfig.from_env()
+
+    assert config.workspaces_enabled is True
+    assert config.namespace is None
+
+
+def test_kubernetes_auth_config_requires_namespace_when_workspaces_disabled(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    monkeypatch.delenv(NAMESPACE_ENV, raising=False)
+
+    with pytest.raises(MlflowException, match=f"{NAMESPACE_ENV} is required"):
+        KubernetesAuthConfig.from_env()
+
+
+def test_kubernetes_auth_config_accepts_namespace_when_workspaces_disabled(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    monkeypatch.setenv(NAMESPACE_ENV, " mlflow-system ")
+
+    config = KubernetesAuthConfig.from_env()
+
+    assert config.workspaces_enabled is False
+    assert config.namespace == "mlflow-system"
+
+
+def test_kubernetes_auth_config_invalid_workspaces_enabled(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "maybe")
+
+    with pytest.raises(MlflowException, match="must be a boolean value"):
         KubernetesAuthConfig.from_env()
 
 
@@ -715,6 +752,40 @@ def test_workspace_scope_string_is_normalized(monkeypatch):
     identity_arg = call_args[0]
     assert identity_arg.token == "valid-token"
     assert call_args[1:] == ("experiments", "list", "team-a", None)
+    assert result.username == "k8s-user"
+
+
+def test_disabled_workspaces_use_configured_namespace_for_access_review(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = True
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [AuthorizationRule("list", resource="experiments")],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+
+    config = KubernetesAuthConfig(workspaces_enabled=False, namespace="mlflow-system")
+    result = _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer " + "valid-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/ajax-api/2.0/mlflow/experiments/search",
+            method="GET",
+            workspace="team-a",
+        ),
+        authorizer=authorizer,
+        config_values=config,
+    )
+
+    call_args = authorizer.is_allowed.call_args[0]
+    assert call_args[1:] == ("experiments", "list", "mlflow-system", None)
+    assert result.request_context.workspace == "mlflow-system"
     assert result.username == "k8s-user"
 
 

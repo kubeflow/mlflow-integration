@@ -116,6 +116,8 @@ def test_fastapi_auth_leaves_non_json_bodies_unloaded(monkeypatch) -> None:
     config.user_header = DEFAULT_REMOTE_USER_HEADER
     config.groups_header = DEFAULT_REMOTE_GROUPS_HEADER
     config.groups_separator = DEFAULT_REMOTE_GROUPS_SEPARATOR
+    config.workspaces_enabled = True
+    config.namespace = None
     app.add_middleware(
         KubernetesAuthMiddleware,
         authorizer=authorizer,
@@ -276,6 +278,8 @@ def mock_config():
     config.user_header = DEFAULT_REMOTE_USER_HEADER
     config.groups_header = DEFAULT_REMOTE_GROUPS_HEADER
     config.groups_separator = DEFAULT_REMOTE_GROUPS_SEPARATOR
+    config.workspaces_enabled = True
+    config.namespace = None
     return config
 
 
@@ -341,6 +345,47 @@ def fastapi_app_with_k8s_auth(mock_authorizer, mock_config):
     app.add_middleware(_WorkspaceContextMiddleware)
 
     return app
+
+
+def test_fastapi_auth_uses_configured_namespace_when_workspaces_disabled(monkeypatch):
+    app = FastAPI()
+
+    @app.get("/ajax-api/2.0/mlflow/experiments/search")
+    async def search_experiments():
+        return {"status": "ok"}
+
+    authorizer = Mock(spec=KubernetesAuthorizer)
+    authorizer.is_allowed.return_value = True
+    config = KubernetesAuthConfig(workspaces_enabled=False, namespace="mlflow-system")
+
+    app.add_middleware(
+        KubernetesAuthMiddleware,
+        authorizer=authorizer,
+        config_values=config,
+    )
+    resolve_workspace = Mock(side_effect=AssertionError("workspace resolution should be skipped"))
+    monkeypatch.setattr(middleware_mod, "resolve_workspace_from_header", resolve_workspace)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [AuthorizationRule("list", resource="experiments")],
+    )
+
+    client = TestClient(app)
+    with patch("mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", return_value="test-user"):
+        response = client.get(
+            "/ajax-api/2.0/mlflow/experiments/search",
+            headers={"Authorization": "Bearer " + "valid-token"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    resolve_workspace.assert_not_called()
+    assert authorizer.is_allowed.call_args[0][1:] == (
+        "experiments",
+        "list",
+        "mlflow-system",
+        None,
+    )
 
 
 def test_otel_endpoint_requires_auth(fastapi_app_with_k8s_auth):
