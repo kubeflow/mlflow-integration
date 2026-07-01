@@ -20,6 +20,7 @@ class AuthorizationRequest:
     remote_groups_header_value: str | None
     path: str
     method: str
+    # Resolved authorization scope for the request.
     workspace: str | None
     headers: dict[str, str] = field(default_factory=dict)
     path_params: dict[str, object] = field(default_factory=dict)

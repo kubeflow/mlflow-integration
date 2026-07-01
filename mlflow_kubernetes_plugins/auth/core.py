@@ -41,6 +41,9 @@ from mlflow_kubernetes_plugins.auth.constants import (
     UNPROTECTED_PATHS as _UNPROTECTED_PATHS,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
+    WORKSPACE_APIS_DISABLED_ERROR_MESSAGE as _WORKSPACE_APIS_DISABLED_ERROR_MESSAGE,
+)
+from mlflow_kubernetes_plugins.auth.constants import (
     WORKSPACE_REQUIRED_ERROR_MESSAGE as _WORKSPACE_REQUIRED_ERROR_MESSAGE,
 )
 from mlflow_kubernetes_plugins.auth.request_context import (
@@ -639,9 +642,9 @@ async def _authorize_request_async(
         identity = _RequestIdentity(user=remote_user, groups=groups)
         username = remote_user
 
-    workspace_name = None
+    resolved_workspace_name = None
     if isinstance(request_context.workspace, str):
-        workspace_name = request_context.workspace.strip() or None
+        resolved_workspace_name = request_context.workspace.strip() or None
 
     from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
 
@@ -665,10 +668,27 @@ async def _authorize_request_async(
             error_code=databricks_pb2.ENDPOINT_NOT_FOUND,
         )
 
-    if not workspace_name:
-        workspace_name = _extract_workspace_scope_from_request(updated_request_context, rules[0])
-        if workspace_name:
-            updated_request_context = replace(updated_request_context, workspace=workspace_name)
+    if not resolved_workspace_name:
+        resolved_workspace_name = _extract_workspace_scope_from_request(
+            updated_request_context, rules[0]
+        )
+        if resolved_workspace_name:
+            updated_request_context = replace(
+                updated_request_context, workspace=resolved_workspace_name
+            )
+
+    workspace_api_request = updated_request_context.path in {
+        "/api/3.0/mlflow/workspaces",
+        "/ajax-api/3.0/mlflow/workspaces",
+    } or updated_request_context.path.startswith(
+        ("/api/3.0/mlflow/workspaces/", "/ajax-api/3.0/mlflow/workspaces/")
+    )
+
+    if not config_values.workspaces_enabled and workspace_api_request:
+        raise MlflowException(
+            _WORKSPACE_APIS_DISABLED_ERROR_MESSAGE,
+            error_code=databricks_pb2.PERMISSION_DENIED,
+        )
 
     response_filter_required = False
     for rule in rules:
@@ -685,7 +705,7 @@ async def _authorize_request_async(
                 error_code=databricks_pb2.PERMISSION_DENIED,
             )
 
-        if rule.requires_workspace and not workspace_name:
+        if rule.requires_workspace and not resolved_workspace_name:
             raise MlflowException(
                 _WORKSPACE_REQUIRED_ERROR_MESSAGE,
                 error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
@@ -707,7 +727,7 @@ async def _authorize_request_async(
                 identity,
                 rule.resource,
                 rule.verb,
-                workspace_name,
+                resolved_workspace_name,
                 rule.subresource,
             )
             has_broad_permission = has_permission
@@ -743,7 +763,7 @@ async def _authorize_request_async(
                         identity,
                         rule.resource,
                         rule.verb,
-                        workspace_name,
+                        resolved_workspace_name,
                         rule.subresource,
                         resource_name=resource_name,
                     )
@@ -774,7 +794,7 @@ async def _authorize_request_async(
                     rule.collection_policy,
                     authorizer=authorizer,
                     identity=identity,
-                    workspace_name=workspace_name,
+                    workspace_name=resolved_workspace_name,
                 )
                 if not request_filter_applied:
                     updated_request_context = await _ensure_request_context_json_body(
@@ -786,7 +806,7 @@ async def _authorize_request_async(
                             rule.collection_policy,
                             authorizer=authorizer,
                             identity=identity,
-                            workspace_name=workspace_name,
+                            workspace_name=resolved_workspace_name,
                         )
                     )
                 if request_filter_applied:
@@ -801,16 +821,20 @@ async def _authorize_request_async(
                     error_code=databricks_pb2.PERMISSION_DENIED,
                 )
             updated_request_context = await _enforce_gateway_dependency_permissions(
-                authorizer, identity, updated_request_context, workspace_name, rule
+                authorizer,
+                identity,
+                updated_request_context,
+                resolved_workspace_name,
+                rule,
             )
         elif rule.workspace_access_check and not rule.apply_workspace_filter:
             # Workspace access check without RBAC verb
-            if not workspace_name:
+            if not resolved_workspace_name:
                 raise MlflowException(
                     _WORKSPACE_REQUIRED_ERROR_MESSAGE,
                     error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
                 )
-            if not authorizer.can_access_workspace(identity, workspace_name, verb="get"):
+            if not authorizer.can_access_workspace(identity, resolved_workspace_name, verb="get"):
                 raise MlflowException(
                     "Permission denied for requested operation.",
                     error_code=databricks_pb2.PERMISSION_DENIED,

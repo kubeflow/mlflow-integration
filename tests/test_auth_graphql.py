@@ -6,12 +6,12 @@ import pytest
 from flask import Flask
 from mlflow.exceptions import MlflowException
 from mlflow.protos.service_pb2 import CreateRun
-from mlflow.utils import workspace_context
 from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthConfig
 from mlflow_kubernetes_plugins.auth.collection_filters import COLLECTION_POLICY_GRAPHQL_FILTER
 from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
 from mlflow_kubernetes_plugins.auth.core import (
     _AUTHORIZATION_HANDLED,
+    _AuthorizationResult,
     _RequestIdentity,
 )
 from mlflow_kubernetes_plugins.auth.graphql import (
@@ -56,6 +56,23 @@ def _compile_rules(compile_auth_rules):
 
 def _invalidate_experiment_lookup_cache(experiment_id: str) -> None:
     resource_names_mod._experiment_name_cache.invalidate(experiment_id)
+
+
+def _graphql_auth_result(workspace: str = "team-a") -> _AuthorizationResult:
+    return _AuthorizationResult(
+        identity=_RequestIdentity(token="token"),
+        rules=[],
+        request_context=AuthorizationRequest(
+            authorization_header="Bearer token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/graphql",
+            method="POST",
+            workspace=workspace,
+        ),
+        username=None,
+    )
 
 
 def test_graphql_operation_map_matches_constant():
@@ -935,10 +952,7 @@ def test_kubernetes_graphql_middleware_filters_search_runs_input(monkeypatch):
     middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
 
     with app.test_request_context("/graphql"):
-        token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
-        )
-        workspace_context.set_server_request_workspace("team-a")
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             input_obj = SimpleNamespace(experiment_ids=["1", "2"])
             info = SimpleNamespace(field_name="mlflowSearchRuns")
@@ -950,7 +964,6 @@ def test_kubernetes_graphql_middleware_filters_search_runs_input(monkeypatch):
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -968,10 +981,7 @@ def test_kubernetes_graphql_middleware_filters_search_datasets_input(monkeypatch
     middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
 
     with app.test_request_context("/graphql"):
-        token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
-        )
-        workspace_context.set_server_request_workspace("team-a")
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             input_obj = SimpleNamespace(experiment_ids=["1", "2"])
             info = SimpleNamespace(field_name="mlflowSearchDatasets")
@@ -983,7 +993,6 @@ def test_kubernetes_graphql_middleware_filters_search_datasets_input(monkeypatch
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -1001,10 +1010,7 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
     middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
 
     with app.test_request_context("/graphql"):
-        token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
-        )
-        workspace_context.set_server_request_workspace("team-a")
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             input_obj = {"experimentIds": ["1", "2"]}
             info = SimpleNamespace(field_name="mlflowSearchRuns")
@@ -1016,7 +1022,6 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -1033,10 +1038,7 @@ def test_kubernetes_graphql_middleware_filters_model_versions_response():
     )
 
     with app.test_request_context("/graphql"):
-        token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
-        )
-        workspace_context.set_server_request_workspace("team-a")
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             info = SimpleNamespace(field_name="mlflowSearchModelVersions")
             filtered = middleware.resolve(
@@ -1047,9 +1049,30 @@ def test_kubernetes_graphql_middleware_filters_model_versions_response():
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert [model.name for model in filtered.model_versions] == ["model-a"]
+
+
+def test_kubernetes_graphql_middleware_tolerates_missing_request_context():
+    app = Flask(__name__)
+    middleware = KubernetesGraphQLAuthorizationMiddleware(Mock())
+
+    with app.test_request_context("/graphql"):
+        token = _AUTHORIZATION_HANDLED.set(
+            SimpleNamespace(identity=_RequestIdentity(token="token"))
+        )
+        try:
+            info = SimpleNamespace(field_name="mlflowSearchRuns")
+            result = middleware.resolve(
+                lambda _root, _info, **kwargs: kwargs["input"],
+                None,
+                info,
+                input=SimpleNamespace(experiment_ids=["1"]),
+            )
+        finally:
+            _AUTHORIZATION_HANDLED.reset(token)
+
+    assert result is None
 
 
 def test_graphql_nested_model_registry_fields_constant():

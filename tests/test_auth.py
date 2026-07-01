@@ -64,6 +64,7 @@ from mlflow.protos.service_pb2 import (
 )
 from mlflow.protos.webhooks_pb2 import DeleteWebhook, GetWebhook, UpdateWebhook
 from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
+from mlflow.server.workspace_helpers import WORKSPACE_HEADER_NAME
 from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     AddGuardrailToEndpoint,
@@ -114,6 +115,7 @@ from mlflow_kubernetes_plugins.auth.compiler import (
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     AUTHORIZATION_MODE_ENV,
+    NAMESPACE_ENV,
     REMOTE_GROUPS_HEADER_ENV,
     REMOTE_USER_HEADER_ENV,
     RESOURCE_ASSISTANTS,
@@ -125,14 +127,18 @@ from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_GATEWAY_MODEL_DEFINITIONS,
     RESOURCE_GATEWAY_SECRETS,
     RESOURCE_REGISTERED_MODELS,
+    WORKSPACES_ENABLED_ENV,
 )
 from mlflow_kubernetes_plugins.auth.core import (
+    _AUTHORIZATION_HANDLED,
+    _AuthorizationResult,
     _canonicalize_path,
     _is_unprotected_path,
     _parse_jwt_subject,
     _parse_remote_groups,
     _RequestIdentity,
 )
+from mlflow_kubernetes_plugins.auth.graphql import KubernetesGraphQLAuthorizationMiddleware
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,
@@ -411,6 +417,43 @@ def test_kubernetes_auth_config_empty_groups_header(monkeypatch):
         KubernetesAuthConfig.from_env()
 
 
+def test_kubernetes_auth_config_defaults_enable_workspaces():
+    config = KubernetesAuthConfig.from_env()
+
+    assert config.workspaces_enabled is True
+    assert config.namespace is None
+
+
+def test_kubernetes_auth_config_invalid_workspaces_enabled(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "sometimes")
+    with pytest.raises(MlflowException, match="must be a boolean value") as exc:
+        KubernetesAuthConfig.from_env()
+
+    assert exc.value.error_code == databricks_pb2.ErrorCode.Name(
+        databricks_pb2.INVALID_PARAMETER_VALUE
+    )
+
+
+def test_kubernetes_auth_config_requires_namespace_when_workspaces_disabled(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    with pytest.raises(MlflowException, match=f"{NAMESPACE_ENV} must be set") as exc:
+        KubernetesAuthConfig.from_env()
+
+    assert exc.value.error_code == databricks_pb2.ErrorCode.Name(
+        databricks_pb2.INVALID_PARAMETER_VALUE
+    )
+
+
+def test_kubernetes_auth_config_reads_fixed_namespace(monkeypatch):
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    monkeypatch.setenv(NAMESPACE_ENV, " team-a ")
+
+    config = KubernetesAuthConfig.from_env()
+
+    assert config.workspaces_enabled is False
+    assert config.namespace == "team-a"
+
+
 def test_flask_create_run_request_processing(monkeypatch):
     from mlflow_kubernetes_plugins.auth.middleware import create_app
 
@@ -462,6 +505,127 @@ def test_flask_create_run_request_processing(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["run"]["info"]["user_id"] == "k8s-user"
+
+
+def test_flask_create_run_uses_configured_namespace_when_workspaces_disabled(monkeypatch):
+    from mlflow.utils import workspace_context
+    from mlflow_kubernetes_plugins.auth.middleware import create_app
+
+    app = Flask(__name__)
+
+    @app.route("/api/2.0/mlflow/runs/create", methods=["POST"])
+    def create_run():
+        data = request.get_json(silent=True)
+        return {
+            "run": {"info": {"run_id": "test-run-id", "user_id": data.get("user_id")}},
+            "workspace_header": request.headers.get(WORKSPACE_HEADER_NAME),
+            "workspace_context": workspace_context.get_request_workspace(),
+        }
+
+    mock_is_allowed = Mock(return_value=True)
+    resolve_workspace = Mock(return_value=SimpleNamespace(name="ignored-workspace"))
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer.KubernetesAuthorizer.is_allowed", mock_is_allowed
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration", lambda: None
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.middleware.resolve_workspace_from_header",
+        resolve_workspace,
+    )
+    monkeypatch.setenv("MLFLOW_K8S_AUTH_CACHE_TTL_SECONDS", "300")
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    monkeypatch.setenv(NAMESPACE_ENV, "team-a")
+
+    client = TestClient(create_app(app))
+
+    with patch("mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", return_value="k8s-user"):
+        response = client.post(
+            "/api/2.0/mlflow/runs/create",
+            json={"experiment_id": "0"},
+            headers={
+                "Authorization": "Bearer test-token",
+                "Host": "localhost",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["workspace_header"] is None
+    assert response.json()["workspace_context"] is None
+    resolve_workspace.assert_not_called()
+    identity, resource, verb, namespace, subresource = mock_is_allowed.call_args[0]
+    assert identity.token == "test-token"
+    assert (resource, verb, namespace, subresource) == ("experiments", "update", "team-a", None)
+
+
+def test_get_workspace_is_denied_when_workspaces_are_disabled(monkeypatch):
+    from mlflow_kubernetes_plugins.auth.middleware import create_app
+
+    app = Flask(__name__)
+
+    @app.route("/api/3.0/mlflow/workspaces/<workspace_name>", methods=["GET"])
+    def get_workspace(workspace_name):
+        return {"workspace": {"name": workspace_name}}
+
+    mock_can_access_workspace = Mock(return_value=True)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer.KubernetesAuthorizer.can_access_workspace",
+        mock_can_access_workspace,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration", lambda: None
+    )
+    monkeypatch.setenv("MLFLOW_K8S_AUTH_CACHE_TTL_SECONDS", "300")
+    monkeypatch.setenv(WORKSPACES_ENABLED_ENV, "false")
+    monkeypatch.setenv(NAMESPACE_ENV, "team-a")
+
+    client = TestClient(create_app(app))
+
+    with patch("mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", return_value="k8s-user"):
+        response = client.get(
+            "/api/3.0/mlflow/workspaces/team-b",
+            headers={
+                "Authorization": "Bearer test-token",
+                "Host": "localhost",
+            },
+        )
+
+    assert response.status_code == 403
+    assert "Workspace APIs are not supported" in response.json()["error"]["message"]
+    mock_can_access_workspace.assert_not_called()
+
+
+def test_graphql_middleware_uses_resolved_authorization_workspace():
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer=Mock())
+    info = SimpleNamespace(field_name="mlflowSearchModelVersions")
+    auth_result = _AuthorizationResult(
+        identity=_RequestIdentity(token="graphql-token"),
+        rules=[],
+        request_context=AuthorizationRequest(
+            authorization_header="Bearer graphql-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/graphql",
+            method="POST",
+            workspace=" team-a ",
+        ),
+        username="k8s-user",
+    )
+
+    token = _AUTHORIZATION_HANDLED.set(auth_result)
+    try:
+        with patch(
+            "mlflow_kubernetes_plugins.auth.graphql.filter_graphql_model_versions_result",
+            return_value={"filtered": True},
+        ) as mock_filter:
+            result = middleware.resolve(lambda root, info, **args: {"raw": True}, None, info)
+    finally:
+        _AUTHORIZATION_HANDLED.reset(token)
+
+    assert result == {"filtered": True}
+    assert mock_filter.call_args.kwargs["workspace_name"] == "team-a"
 
 
 def _build_workspace_app(monkeypatch):

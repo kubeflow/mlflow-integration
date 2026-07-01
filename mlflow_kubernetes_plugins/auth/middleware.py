@@ -315,10 +315,14 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
             if _is_unprotected_path(canonical_path):
                 return await call_next(request)
 
-            workspace_name = workspace_context.get_request_workspace()
+            resolved_workspace_name = (
+                workspace_context.get_request_workspace()
+                if self.config_values.workspaces_enabled
+                else self.config_values.namespace
+            )
             workspace_set = False
 
-            if workspace_name is None:
+            if self.config_values.workspaces_enabled and resolved_workspace_name is None:
                 # FastAPI executes middlewares in reverse order, so this auth middleware can run
                 # before the MLflow workspace middleware. Resolve here using the same helper, which
                 # also falls back to the configured default workspace when the header is missing
@@ -334,8 +338,8 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
                     )
 
                 if workspace is not None:
-                    workspace_name = workspace.name
-                    workspace_context.set_server_request_workspace(workspace_name)
+                    resolved_workspace_name = workspace.name
+                    workspace_context.set_server_request_workspace(resolved_workspace_name)
                     workspace_set = True
 
             path_params = _extract_path_params(canonical_path, request.method) or dict(
@@ -350,7 +354,7 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
                 request,
                 self.config_values,
                 path=canonical_path,
-                workspace=workspace_name,
+                workspace=resolved_workspace_name,
                 json_body=state.get(_REQUEST_JSON_BODY_STATE_KEY),
                 path_params=path_params,
                 ensure_json_body=_ensure_auth_request_json_body,
