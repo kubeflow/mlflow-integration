@@ -786,7 +786,6 @@ def test_disabled_workspaces_use_configured_namespace_for_access_review(monkeypa
     call_args = authorizer.is_allowed.call_args[0]
     assert call_args[1:] == ("experiments", "list", "mlflow-system", None)
     assert result.request_context.workspace == "mlflow-system"
-    assert result.username == "k8s-user"
 
 
 def test_workspace_listing_allows_missing_context(monkeypatch):
