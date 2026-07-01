@@ -62,30 +62,110 @@ else:  # pragma: no cover - exercised via MLflow version matrix
     ListEndpointGuardrailConfigs = None
     UpdateEndpointGuardrailConfig = None
 
+try:
+    label_schemas_pb2 = importlib.import_module("mlflow.protos.label_schemas_pb2")
+    CreateLabelSchema = label_schemas_pb2.CreateLabelSchema
+    GetLabelSchema = label_schemas_pb2.GetLabelSchema
+    GetLabelSchemaByName = label_schemas_pb2.GetLabelSchemaByName
+    ListLabelSchemas = label_schemas_pb2.ListLabelSchemas
+    UpdateLabelSchema = label_schemas_pb2.UpdateLabelSchema
+    DeleteLabelSchema = label_schemas_pb2.DeleteLabelSchema
+except (ImportError, AttributeError):  # pragma: no cover - exercised via MLflow version matrix
+    CreateLabelSchema = None
+    GetLabelSchema = None
+    GetLabelSchemaByName = None
+    ListLabelSchemas = None
+    UpdateLabelSchema = None
+    DeleteLabelSchema = None
+
+try:
+    review_queues_pb2 = importlib.import_module("mlflow.protos.review_queues_pb2")
+    AddItemsToReviewQueue = review_queues_pb2.AddItemsToReviewQueue
+    CreateReviewQueue = review_queues_pb2.CreateReviewQueue
+    DeleteReviewQueue = review_queues_pb2.DeleteReviewQueue
+    GetOrCreateUserQueue = review_queues_pb2.GetOrCreateUserQueue
+    GetReviewQueue = review_queues_pb2.GetReviewQueue
+    GetReviewQueueByName = review_queues_pb2.GetReviewQueueByName
+    ListReviewQueueItems = review_queues_pb2.ListReviewQueueItems
+    ListReviewQueues = review_queues_pb2.ListReviewQueues
+    RemoveItemsFromReviewQueue = review_queues_pb2.RemoveItemsFromReviewQueue
+    SetReviewQueueItemStatus = review_queues_pb2.SetReviewQueueItemStatus
+    UpdateReviewQueue = review_queues_pb2.UpdateReviewQueue
+except (ImportError, AttributeError):  # pragma: no cover - exercised via MLflow version matrix
+    AddItemsToReviewQueue = None
+    CreateReviewQueue = None
+    DeleteReviewQueue = None
+    GetOrCreateUserQueue = None
+    GetReviewQueue = None
+    GetReviewQueueByName = None
+    ListReviewQueueItems = None
+    ListReviewQueues = None
+    RemoveItemsFromReviewQueue = None
+    SetReviewQueueItemStatus = None
+    UpdateReviewQueue = None
+
+HAS_MLFLOW_GENAI_REVIEW_SURFACE = (
+    CreateLabelSchema is not None
+    and GetLabelSchema is not None
+    and GetLabelSchemaByName is not None
+    and ListLabelSchemas is not None
+    and UpdateLabelSchema is not None
+    and DeleteLabelSchema is not None
+    and AddItemsToReviewQueue is not None
+    and CreateReviewQueue is not None
+    and DeleteReviewQueue is not None
+    and GetOrCreateUserQueue is not None
+    and GetReviewQueue is not None
+    and GetReviewQueueByName is not None
+    and ListReviewQueueItems is not None
+    and ListReviewQueues is not None
+    and RemoveItemsFromReviewQueue is not None
+    and SetReviewQueueItemStatus is not None
+    and UpdateReviewQueue is not None
+)
+
 __all__ = [
     "AddGuardrailToEndpoint",
+    "AddItemsToReviewQueue",
     "BatchGetTraceInfos",
     "CreateGatewayGuardrail",
     "CreateGatewayBudgetPolicy",
     "CreateIssue",
+    "CreateLabelSchema",
     "CreatePresignedUploadUrl",
+    "CreateReviewQueue",
     "DeleteGatewayGuardrail",
     "DeleteGatewayBudgetPolicy",
+    "DeleteLabelSchema",
+    "DeleteReviewQueue",
     "GetGatewayGuardrail",
     "GetGatewayBudgetPolicy",
     "GetIssue",
+    "GetLabelSchema",
+    "GetLabelSchemaByName",
+    "GetOrCreateUserQueue",
     "GetPresignedDownloadUrl",
+    "GetReviewQueue",
+    "GetReviewQueueByName",
     "HAS_MLFLOW_3_11_AUTH_SURFACE",
     "HAS_MLFLOW_3_12_AUTH_SURFACE",
     "HAS_MLFLOW_3_13_AUTH_SURFACE",
+    "HAS_MLFLOW_GENAI_REVIEW_SURFACE",
     "ListEndpointGuardrailConfigs",
     "ListGatewayGuardrails",
     "ListGatewayBudgetPolicies",
     "ListGatewayBudgetWindows",
+    "ListLabelSchemas",
+    "ListReviewQueueItems",
+    "ListReviewQueues",
     "MLFLOW_VERSION",
     "RemoveGuardrailFromEndpoint",
+    "RemoveItemsFromReviewQueue",
     "SearchIssues",
+    "SetReviewQueueItemStatus",
     "UpdateEndpointGuardrailConfig",
     "UpdateGatewayBudgetPolicy",
     "UpdateIssue",
+    "UpdateLabelSchema",
+    "UpdateReviewQueue",
 ]

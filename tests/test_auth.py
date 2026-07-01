@@ -147,6 +147,7 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,
     RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME,
     RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,
+    RESOURCE_NAME_PARSER_LABEL_SCHEMA_ID_TO_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME,
     RESOURCE_NAME_PARSER_OPTIONAL_ACTION_ENDPOINT_ID_TO_NAME,
@@ -154,6 +155,7 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME,
     RESOURCE_NAME_PARSER_OPTIONAL_TRACE_IDS_TO_EXPERIMENT_NAMES,
     RESOURCE_NAME_PARSER_REGISTERED_MODEL_NAME,
+    RESOURCE_NAME_PARSER_REVIEW_QUEUE_ID_TO_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_TRACE_V3_EXPERIMENT_ID_TO_NAME,
     RESOURCE_NAME_PARSER_WEBHOOK_ID_TO_REGISTERED_MODEL_NAME,
@@ -2813,6 +2815,56 @@ def test_resolve_resource_names_issue_id_to_experiment_name(monkeypatch):
     assert resolve_resource_names(
         request_context, (RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,)
     ) == ("issue-exp",)
+
+
+def test_resolve_resource_names_label_schema_id_to_experiment_name(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: SimpleNamespace(
+            get_label_schema=lambda schema_id: SimpleNamespace(experiment_id="43"),
+            get_experiment=lambda experiment_id: SimpleNamespace(name="label-exp"),
+        ),
+    )
+
+    request_context = AuthorizationRequest(
+        authorization_header="******",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/label-schemas/get",
+        method="GET",
+        workspace="team-a",
+        query_params={"schema_id": "schema-123"},
+    )
+
+    assert resolve_resource_names(
+        request_context, (RESOURCE_NAME_PARSER_LABEL_SCHEMA_ID_TO_EXPERIMENT_NAME,)
+    ) == ("label-exp",)
+
+
+def test_resolve_resource_names_review_queue_id_to_experiment_name(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: SimpleNamespace(
+            get_review_queue=lambda queue_id: SimpleNamespace(experiment_id="44"),
+            get_experiment=lambda experiment_id: SimpleNamespace(name="queue-exp"),
+        ),
+    )
+
+    request_context = AuthorizationRequest(
+        authorization_header="******",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/review-queues/items/add",
+        method="POST",
+        workspace="team-a",
+        json_body={"queue_id": "queue-123"},
+    )
+
+    assert resolve_resource_names(
+        request_context, (RESOURCE_NAME_PARSER_REVIEW_QUEUE_ID_TO_EXPERIMENT_NAME,)
+    ) == ("queue-exp",)
 
 
 def test_compile_rules_raise_for_uncovered_endpoint(monkeypatch):

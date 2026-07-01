@@ -31,6 +31,8 @@ RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME = "new_registered_model_name"
 RESOURCE_NAME_PARSER_WEBHOOK_ID_TO_REGISTERED_MODEL_NAME = "webhook_id_to_registered_model_name"
 RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME = "job_id_to_experiment_name"
 RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME = "issue_id_to_experiment_name"
+RESOURCE_NAME_PARSER_LABEL_SCHEMA_ID_TO_EXPERIMENT_NAME = "label_schema_id_to_experiment_name"
+RESOURCE_NAME_PARSER_REVIEW_QUEUE_ID_TO_EXPERIMENT_NAME = "review_queue_id_to_experiment_name"
 RESOURCE_NAME_PARSER_TRACE_REQUEST_ID_TO_EXPERIMENT_NAME = "trace_request_id_to_experiment_name"
 RESOURCE_NAME_PARSER_TRACE_ID_TO_EXPERIMENT_NAME = "trace_id_to_experiment_name"
 RESOURCE_NAME_PARSER_OPTIONAL_TRACE_IDS_TO_EXPERIMENT_NAMES = (
@@ -383,6 +385,44 @@ def _resolve_experiment_name_from_issue_id(issue_id: str) -> str:
     return _resolve_experiment_name_from_experiment_id(experiment_id)
 
 
+def _resolve_experiment_name_from_label_schema_id(schema_id: str) -> str:
+    store = _get_tracking_store()
+    getter = getattr(store, "get_label_schema", None)
+    if getter is None:
+        raise ResourceNameResolutionError(
+            "Label schema lookup is unavailable in this MLflow version."
+        )
+    try:
+        label_schema = getter(schema_id)
+    except MlflowException as exc:
+        raise ResourceNameResolutionError(f"Could not resolve schema_id '{schema_id}'.") from exc
+    experiment_id = _normalize_string(getattr(label_schema, "experiment_id", None))
+    if experiment_id is None:
+        raise ResourceNameResolutionError(
+            f"Could not resolve experiment_id for schema_id '{schema_id}'."
+        )
+    return _resolve_experiment_name_from_experiment_id(experiment_id)
+
+
+def _resolve_experiment_name_from_review_queue_id(queue_id: str) -> str:
+    store = _get_tracking_store()
+    getter = getattr(store, "get_review_queue", None)
+    if getter is None:
+        raise ResourceNameResolutionError(
+            "Review queue lookup is unavailable in this MLflow version."
+        )
+    try:
+        review_queue = getter(queue_id)
+    except MlflowException as exc:
+        raise ResourceNameResolutionError(f"Could not resolve queue_id '{queue_id}'.") from exc
+    experiment_id = _normalize_string(getattr(review_queue, "experiment_id", None))
+    if experiment_id is None:
+        raise ResourceNameResolutionError(
+            f"Could not resolve experiment_id for queue_id '{queue_id}'."
+        )
+    return _resolve_experiment_name_from_experiment_id(experiment_id)
+
+
 def _resolve_experiment_name_from_trace_id(trace_id: str) -> str:
     try:
         trace = _get_tracking_store().get_trace_info(trace_id)
@@ -580,6 +620,26 @@ def _parse_job_id_to_experiment_name(request_context: AuthorizationRequest) -> t
 def _parse_issue_id_to_experiment_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
     return (
         _resolve_experiment_name_from_issue_id(_get_request_param(request_context, "issue_id")),
+    )
+
+
+def _parse_label_schema_id_to_experiment_name(
+    request_context: AuthorizationRequest,
+) -> tuple[str, ...]:
+    return (
+        _resolve_experiment_name_from_label_schema_id(
+            _get_request_param(request_context, "schema_id")
+        ),
+    )
+
+
+def _parse_review_queue_id_to_experiment_name(
+    request_context: AuthorizationRequest,
+) -> tuple[str, ...]:
+    return (
+        _resolve_experiment_name_from_review_queue_id(
+            _get_request_param(request_context, "queue_id")
+        ),
     )
 
 
@@ -924,6 +984,12 @@ RESOURCE_NAME_PARSERS: dict[str, "Callable[[AuthorizationRequest], tuple[str, ..
     ),
     RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME: _parse_job_id_to_experiment_name,
     RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME: _parse_issue_id_to_experiment_name,
+    RESOURCE_NAME_PARSER_LABEL_SCHEMA_ID_TO_EXPERIMENT_NAME: (
+        _parse_label_schema_id_to_experiment_name
+    ),
+    RESOURCE_NAME_PARSER_REVIEW_QUEUE_ID_TO_EXPERIMENT_NAME: (
+        _parse_review_queue_id_to_experiment_name
+    ),
     RESOURCE_NAME_PARSER_TRACE_REQUEST_ID_TO_EXPERIMENT_NAME: (
         _parse_trace_request_id_to_experiment_name
     ),
@@ -1035,12 +1101,14 @@ __all__ = [
     "RESOURCE_NAME_PARSER_GRAPHQL_RUN_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME",
+    "RESOURCE_NAME_PARSER_LABEL_SCHEMA_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME",
     "RESOURCE_NAME_PARSER_OTEL_EXPERIMENT_ID_HEADER_TO_NAME",
     "RESOURCE_NAME_PARSER_OPTIONAL_ACTION_ENDPOINT_ID_TO_NAME",
     "RESOURCE_NAME_PARSER_REGISTERED_MODEL_NAME",
+    "RESOURCE_NAME_PARSER_REVIEW_QUEUE_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_TRACE_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_TRACE_REQUEST_ID_TO_EXPERIMENT_NAME",
