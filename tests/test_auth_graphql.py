@@ -6,7 +6,6 @@ import pytest
 from flask import Flask
 from mlflow.exceptions import MlflowException
 from mlflow.protos.service_pb2 import CreateRun
-from mlflow.utils import workspace_context
 from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthConfig
 from mlflow_kubernetes_plugins.auth.collection_filters import COLLECTION_POLICY_GRAPHQL_FILTER
 from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
@@ -936,9 +935,11 @@ def test_kubernetes_graphql_middleware_filters_search_runs_input(monkeypatch):
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
+            SimpleNamespace(
+                identity=_RequestIdentity(token="token"),
+                request_context=SimpleNamespace(workspace="team-a"),
+            )
         )
-        workspace_context.set_server_request_workspace("team-a")
         try:
             input_obj = SimpleNamespace(experiment_ids=["1", "2"])
             info = SimpleNamespace(field_name="mlflowSearchRuns")
@@ -950,7 +951,6 @@ def test_kubernetes_graphql_middleware_filters_search_runs_input(monkeypatch):
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -969,9 +969,11 @@ def test_kubernetes_graphql_middleware_filters_search_datasets_input(monkeypatch
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
+            SimpleNamespace(
+                identity=_RequestIdentity(token="token"),
+                request_context=SimpleNamespace(workspace="team-a"),
+            )
         )
-        workspace_context.set_server_request_workspace("team-a")
         try:
             input_obj = SimpleNamespace(experiment_ids=["1", "2"])
             info = SimpleNamespace(field_name="mlflowSearchDatasets")
@@ -983,7 +985,6 @@ def test_kubernetes_graphql_middleware_filters_search_datasets_input(monkeypatch
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -1002,9 +1003,11 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
+            SimpleNamespace(
+                identity=_RequestIdentity(token="token"),
+                request_context=SimpleNamespace(workspace="team-a"),
+            )
         )
-        workspace_context.set_server_request_workspace("team-a")
         try:
             input_obj = {"experimentIds": ["1", "2"]}
             info = SimpleNamespace(field_name="mlflowSearchRuns")
@@ -1016,7 +1019,6 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert result == ["1"]
 
@@ -1034,9 +1036,11 @@ def test_kubernetes_graphql_middleware_filters_model_versions_response():
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(
-            SimpleNamespace(identity=_RequestIdentity(token="token"))
+            SimpleNamespace(
+                identity=_RequestIdentity(token="token"),
+                request_context=SimpleNamespace(workspace="team-a"),
+            )
         )
-        workspace_context.set_server_request_workspace("team-a")
         try:
             info = SimpleNamespace(field_name="mlflowSearchModelVersions")
             filtered = middleware.resolve(
@@ -1047,7 +1051,6 @@ def test_kubernetes_graphql_middleware_filters_model_versions_response():
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
-            workspace_context.clear_server_request_workspace()
 
     assert [model.name for model in filtered.model_versions] == ["model-a"]
 

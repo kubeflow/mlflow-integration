@@ -773,7 +773,7 @@ def test_disabled_workspaces_use_configured_namespace_for_access_review(
         lambda token, claim: "k8s-user",
     )
 
-    config = KubernetesAuthConfig(workspaces_enabled=False, namespace="mlflow-system")
+    config = KubernetesAuthConfig(workspaces_enabled=False, namespace=" mlflow-system ")
     result = _authorize_request(
         AuthorizationRequest(
             authorization_header="Bearer " + "valid-token",

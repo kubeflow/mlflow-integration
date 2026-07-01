@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import graphql
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
-from mlflow.utils import workspace_context
 
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_GRAPHQL_FILTER,
@@ -527,7 +526,9 @@ class KubernetesGraphQLAuthorizationMiddleware:
 
         auth_result = _AUTHORIZATION_HANDLED.get()
         identity = auth_result.identity if auth_result is not None else None
-        workspace_name = workspace_context.get_request_workspace()
+        workspace_name = (
+            auth_result.request_context.workspace if auth_result is not None else None
+        )
         if identity is None or not workspace_name:
             _logger.warning(
                 "GraphQL collection authorization missing identity or workspace for field %s",
