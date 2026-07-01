@@ -701,7 +701,7 @@ async def _authorize_request_async(
             )
 
         if rule.verb is not None:
-            if not workspace_name:
+            if config_values.workspaces_enabled and not workspace_name:
                 raise MlflowException(
                     _WORKSPACE_REQUIRED_ERROR_MESSAGE,
                     error_code=databricks_pb2.INVALID_PARAMETER_VALUE,

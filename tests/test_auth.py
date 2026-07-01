@@ -755,7 +755,10 @@ def test_workspace_scope_string_is_normalized(monkeypatch):
     assert result.username == "k8s-user"
 
 
-def test_disabled_workspaces_use_configured_namespace_for_access_review(monkeypatch):
+@pytest.mark.parametrize("request_workspace", ["team-a", None])
+def test_disabled_workspaces_use_configured_namespace_for_access_review(
+    monkeypatch, request_workspace
+):
     authorizer = Mock()
     authorizer.is_allowed.return_value = True
 
@@ -777,7 +780,7 @@ def test_disabled_workspaces_use_configured_namespace_for_access_review(monkeypa
             remote_groups_header_value=None,
             path="/ajax-api/2.0/mlflow/experiments/search",
             method="GET",
-            workspace="team-a",
+            workspace=request_workspace,
         ),
         authorizer=authorizer,
         config_values=config,
