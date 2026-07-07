@@ -2,6 +2,7 @@ SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
 IMG ?= mlflow-integration
+UV_RUN ?= uv run
 CONTAINER_TOOL ?= docker
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
@@ -13,15 +14,15 @@ install-dev: ## Install uv dependencies for local development.
 
 .PHONY: python-lint
 python-lint: ## Run Python lint checks.
-	@uv run ruff check .
+	@$(UV_RUN) ruff check .
 
 .PHONY: python-typecheck
 python-typecheck: ## Run Python type checker.
-	@uv run ty check mlflow_kubernetes_plugins
+	@$(UV_RUN) ty check mlflow_kubernetes_plugins
 
 .PHONY: python-test
 python-test: ## Run Python test suite.
-	@uv run pytest -v
+	@$(UV_RUN) pytest -v
 
 .PHONY: python-build
 python-build: ## Build Python distribution artifacts.

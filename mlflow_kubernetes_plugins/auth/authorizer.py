@@ -27,11 +27,14 @@ from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
     DEFAULT_REMOTE_USER_HEADER,
     DEFAULT_USERNAME_CLAIM,
+    DEFAULT_WORKSPACES_ENABLED,
+    NAMESPACE_ENV,
     REMOTE_GROUPS_HEADER_ENV,
     REMOTE_GROUPS_SEPARATOR_ENV,
     REMOTE_USER_HEADER_ENV,
     USERNAME_CLAIM_ENV,
     WORKSPACE_PERMISSION_RESOURCE_PRIORITY,
+    WORKSPACES_ENABLED_ENV,
 )
 
 if TYPE_CHECKING:
@@ -43,6 +46,22 @@ _logger = logging.getLogger(__name__)
 class AuthorizationMode(str, Enum):
     SELF_SUBJECT_ACCESS_REVIEW = "self_subject_access_review"
     SUBJECT_ACCESS_REVIEW = "subject_access_review"
+
+
+def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise MlflowException(
+        f"Environment variable {name} must be a boolean value if set",
+        error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+    )
 
 
 class _ReadWriteLock:
@@ -457,6 +476,8 @@ class KubernetesAuthConfig:
     user_header: str = DEFAULT_REMOTE_USER_HEADER
     groups_header: str = DEFAULT_REMOTE_GROUPS_HEADER
     groups_separator: str = DEFAULT_REMOTE_GROUPS_SEPARATOR
+    workspaces_enabled: bool = DEFAULT_WORKSPACES_ENABLED
+    namespace: str | None = None
 
     @classmethod
     def from_env(cls) -> "KubernetesAuthConfig":
@@ -470,6 +491,12 @@ class KubernetesAuthConfig:
         groups_separator = os.environ.get(
             REMOTE_GROUPS_SEPARATOR_ENV, DEFAULT_REMOTE_GROUPS_SEPARATOR
         )
+        workspaces_enabled = _parse_bool_env(
+            WORKSPACES_ENABLED_ENV,
+            os.environ.get(WORKSPACES_ENABLED_ENV),
+            default=DEFAULT_WORKSPACES_ENABLED,
+        )
+        namespace = os.environ.get(NAMESPACE_ENV)
 
         cache_ttl_seconds = DEFAULT_CACHE_TTL_SECONDS
         if ttl_env:
@@ -494,6 +521,7 @@ class KubernetesAuthConfig:
 
         user_header = user_header.strip()
         groups_header = groups_header.strip()
+        namespace = (namespace.strip() or None) if isinstance(namespace, str) else None
         if not user_header:
             raise MlflowException(
                 f"Environment variable {REMOTE_USER_HEADER_ENV} cannot be empty",
@@ -504,6 +532,12 @@ class KubernetesAuthConfig:
                 f"Environment variable {REMOTE_GROUPS_HEADER_ENV} cannot be empty",
                 error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
             )
+        if not workspaces_enabled and not namespace:
+            raise MlflowException(
+                f"Environment variable {NAMESPACE_ENV} must be set when "
+                f"{WORKSPACES_ENABLED_ENV}=false",
+                error_code=databricks_pb2.INVALID_PARAMETER_VALUE,
+            )
 
         return cls(
             cache_ttl_seconds=cache_ttl_seconds,
@@ -512,6 +546,8 @@ class KubernetesAuthConfig:
             user_header=user_header,
             groups_header=groups_header,
             groups_separator=groups_separator or DEFAULT_REMOTE_GROUPS_SEPARATOR,
+            workspaces_enabled=workspaces_enabled,
+            namespace=namespace,
         )
 
 

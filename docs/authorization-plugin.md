@@ -39,6 +39,8 @@ mlflow server \
 | `MLFLOW_K8S_AUTH_REMOTE_USER_HEADER` | `x-remote-user` | Username header used in trusted-proxy mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_GROUPS_HEADER` | `x-remote-groups` | Groups header used in trusted-proxy mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_GROUPS_SEPARATOR` | `\|` | Separator used to split the groups header. |
+| `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED` | `true` | Enables workspace-based authorization scope resolution. |
+| `MLFLOW_K8S_AUTH_NAMESPACE` | unset | Fixed namespace for SAR and SSAR checks when workspaces are disabled. Required when `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED=false`. |
 
 ## Authorization Modes
 
@@ -65,6 +67,25 @@ export MLFLOW_K8S_AUTH_REMOTE_GROUPS_SEPARATOR="|"
 
 Use this mode only behind a trusted proxy such as `kube-rbac-proxy` that authenticates callers before forwarding requests to MLflow.
 
+## Single-Namespace Mode
+
+If you do not want to run MLflow with workspaces enabled, disable workspace resolution in the
+auth plugin and set the namespace to authorize against:
+
+```bash
+export MLFLOW_K8S_AUTH_WORKSPACES_ENABLED=false
+export MLFLOW_K8S_AUTH_NAMESPACE=team-a
+
+mlflow server \
+  --backend-store-uri postgresql://user:pass@localhost/mlflow \
+  --default-artifact-root s3://mlflow-artifacts \
+  --app-name kubernetes-auth
+```
+
+In this mode, the auth plugin skips workspace header resolution and uses
+`MLFLOW_K8S_AUTH_NAMESPACE` as the resolved authorization scope for SAR and SSAR checks.
+Workspace API endpoints are not supported in this mode.
+
 ## Request Requirements
 
 For authenticated requests, clients typically need:
@@ -81,6 +102,9 @@ curl \
   -H "X-MLFLOW-WORKSPACE: team-a" \
   http://mlflow.example/api/2.0/mlflow/experiments/search
 ```
+
+When `MLFLOW_K8S_AUTH_WORKSPACES_ENABLED=false`, the workspace header is not required because the
+plugin uses the configured namespace instead.
 
 ## Notes
 

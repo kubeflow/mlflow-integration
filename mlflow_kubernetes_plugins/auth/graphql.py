@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import graphql
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
-from mlflow.utils import workspace_context
 
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_GRAPHQL_FILTER,
@@ -514,6 +513,14 @@ class KubernetesGraphQLAuthorizationMiddleware:
     def __init__(self, authorizer) -> None:
         self._authorizer = authorizer
 
+    @staticmethod
+    def _resolved_workspace_name(auth_result) -> str | None:
+        request_context = getattr(auth_result, "request_context", None)
+        workspace = getattr(request_context, "workspace", None)
+        if not isinstance(workspace, str):
+            return None
+        return workspace.strip() or None
+
     def resolve(self, next, root, info, **args):
         field_name = info.field_name
         policy = GRAPHQL_FIELD_AUTH_POLICY_MAP.get(field_name)
@@ -526,9 +533,12 @@ class KubernetesGraphQLAuthorizationMiddleware:
         from mlflow_kubernetes_plugins.auth.core import _AUTHORIZATION_HANDLED
 
         auth_result = _AUTHORIZATION_HANDLED.get()
-        identity = auth_result.identity if auth_result is not None else None
-        workspace_name = workspace_context.get_request_workspace()
-        if identity is None or not workspace_name:
+        identity = None
+        resolved_workspace_name = None
+        if auth_result is not None:
+            identity = getattr(auth_result, "identity", None)
+            resolved_workspace_name = self._resolved_workspace_name(auth_result)
+        if identity is None or not resolved_workspace_name:
             _logger.warning(
                 "GraphQL collection authorization missing identity or workspace for field %s",
                 field_name,
@@ -551,7 +561,7 @@ class KubernetesGraphQLAuthorizationMiddleware:
                 readable_ids = filter_graphql_experiment_ids(
                     self._authorizer,
                     identity,
-                    workspace_name,
+                    resolved_workspace_name,
                     [str(experiment_id) for experiment_id in experiment_ids],
                 )
                 if not readable_ids:
@@ -574,7 +584,7 @@ class KubernetesGraphQLAuthorizationMiddleware:
                 result,
                 authorizer=self._authorizer,
                 identity=identity,
-                workspace_name=workspace_name,
+                workspace_name=resolved_workspace_name,
             )
         return result
 
