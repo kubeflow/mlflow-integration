@@ -242,8 +242,11 @@ class KubernetesAuthorizer:
         configuration.username = None
         configuration.password = None
         configuration.refresh_api_key_hook = None
-        configuration.api_key = {"authorization": token}
-        configuration.api_key_prefix = {"authorization": "Bearer"}
+        # Set both legacy ('authorization') and v36+ ('BearerToken') keys.
+        # kubernetes-client/python still has a compatibility gap across v35-v36
+        # for manually constructed Configuration objects; see issues #2592 and PR #2618.
+        configuration.api_key = {"BearerToken": token, "authorization": token}
+        configuration.api_key_prefix = {"BearerToken": "Bearer", "authorization": "Bearer"}
         return client.ApiClient(configuration)
 
     def _submit_self_subject_access_review(

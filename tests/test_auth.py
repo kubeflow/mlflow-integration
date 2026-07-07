@@ -4216,6 +4216,40 @@ def test_subject_access_review_authorizer_close_is_idempotent(monkeypatch):
     fake_client.close.assert_called_once()
 
 
+def test_build_api_client_with_token_sets_both_bearer_keys():
+    """Verify _build_api_client_with_token sets both 'BearerToken' and 'authorization'
+    api_key entries for compatibility across kubernetes client v35-v36+.
+
+    See https://github.com/kubernetes-client/python/issues/2592
+    """
+    from kubernetes import client
+
+    base_conf = client.Configuration()
+    base_conf.host = "https://localhost:6443"
+    base_conf.ssl_ca_cert = None
+    base_conf.verify_ssl = False
+
+    authorizer = KubernetesAuthorizer(
+        KubernetesAuthConfig(authorization_mode=AuthorizationMode.SELF_SUBJECT_ACCESS_REVIEW)
+    )
+    authorizer._base_configuration = base_conf
+
+    token = "test-token-value"
+    api_client = authorizer._build_api_client_with_token(token)
+    conf = api_client.configuration
+
+    assert "BearerToken" in conf.api_key, "missing BearerToken api_key (needed for k8s client v36+)"
+    assert "authorization" in conf.api_key, "missing authorization api_key (needed for k8s client v35)"
+    assert conf.api_key["BearerToken"] == token
+    assert conf.api_key["authorization"] == token
+    assert conf.api_key_prefix["BearerToken"] == "Bearer"
+    assert conf.api_key_prefix["authorization"] == "Bearer"
+
+    auth = conf.auth_settings()
+    assert "BearerToken" in auth, "auth_settings() must resolve a BearerToken entry"
+    assert auth["BearerToken"]["value"] == f"Bearer {token}"
+
+
 def test_normalize_rules_single_rule():
     rule = AuthorizationRule("get", resource=RESOURCE_EXPERIMENTS)
     assert _normalize_rules(rule) == [rule]
