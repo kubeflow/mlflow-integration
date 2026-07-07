@@ -1,0 +1,25 @@
+# CI values for standalone deployment testing.
+
+mlflow:
+  backendStoreUri: "sqlite:////mlflow/mlflow.db"
+  artifactsDestination: "file:///mlflow/artifacts"
+  authorizationMode: self_subject_access_review
+
+storage:
+  enabled: true
+  size: 2Gi
+
+tls:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+metrics:
+  enabled: false
+
+garbageCollection:
+  enabled: false
+
+traceArchival:
+  enabled: false

@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mlflow.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    {{- include "mlflow.serverSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: {{ include "mlflow.portName" . }}
+      protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: {{ include "mlflow.portName" . }}
+  type: {{ .Values.service.type }}

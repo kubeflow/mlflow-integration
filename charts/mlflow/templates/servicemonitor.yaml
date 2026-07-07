@@ -1,0 +1,25 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mlflow.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+spec:
+  endpoints:
+    - path: /metrics
+      port: {{ include "mlflow.portName" . }}
+      {{- if .Values.tls.enabled }}
+      scheme: https
+      {{- with .Values.metrics.tlsConfig }}
+      tlsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- else }}
+      scheme: http
+      {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mlflow.serverSelectorLabels" . | nindent 6 }}
+{{- end }}

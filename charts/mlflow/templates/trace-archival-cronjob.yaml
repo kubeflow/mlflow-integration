@@ -1,0 +1,158 @@
+{{- if .Values.traceArchival.enabled }}
+{{- if not .Values.traceArchival.location }}
+{{- fail "traceArchival.location is required when traceArchival.enabled is true" }}
+{{- end }}
+{{- if not .Values.traceArchival.retention }}
+{{- fail "traceArchival.retention is required when traceArchival.enabled is true" }}
+{{- end }}
+{{- if and (hasPrefix "file://" .Values.traceArchival.location) (not .Values.storage.enabled) }}
+{{- fail "storage must be enabled when traceArchival.location uses file-based storage (file:// prefix)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "mlflow.traceArchival.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trace-archival
+spec:
+  schedule: {{ .Values.traceArchival.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "mlflow.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: trace-archival
+        spec:
+          serviceAccountName: {{ include "mlflow.traceArchival.fullname" . }}
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 128Mi
+            - name: trace-archival-config
+              configMap:
+                name: {{ include "mlflow.traceArchival.configMapName" . }}
+            {{- if .Values.storage.enabled }}
+            - name: mlflow-storage
+              persistentVolumeClaim:
+                claimName: {{ include "mlflow.fullname" . }}
+            {{- end }}
+            {{- include "mlflow.caBundleVolumes" . | nindent 12 }}
+          {{- include "mlflow.caBundleInitContainers" . | nindent 10 }}
+          containers:
+            - name: mlflow-trace-archival
+              image: {{ include "mlflow.image" . }}
+              {{- if .Values.image.pullPolicy }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- end }}
+              command:
+                - python
+                - -c
+                - "from mlflow.tracing.trace_archival_service import run_trace_archival_scheduler; run_trace_archival_scheduler()"
+              env:
+                - name: MLFLOW_DISABLE_TELEMETRY
+                  value: "true"
+                - name: MLFLOW_TRACE_ARCHIVAL_CONFIG
+                  value: "/etc/mlflow/trace-archival.yaml"
+                - name: MLFLOW_ENABLE_WORKSPACES
+                  value: "true"
+                - name: MLFLOW_WORKSPACE_STORE_URI
+                  value: {{ .Values.mlflow.workspaceStoreUri | quote }}
+                {{- if .Values.mlflow.workspaceLabelSelector }}
+                - name: MLFLOW_K8S_WORKSPACE_LABEL_SELECTOR
+                  value: {{ .Values.mlflow.workspaceLabelSelector | quote }}
+                {{- end }}
+                - name: MLFLOW_BACKEND_STORE_URI
+                  {{- if .Values.mlflow.backendStoreUriFrom }}
+                  valueFrom:
+                    {{- toYaml .Values.mlflow.backendStoreUriFrom | nindent 20 }}
+                  {{- else }}
+                  value: {{ .Values.mlflow.backendStoreUri | quote }}
+                  {{- end }}
+                - name: MLFLOW_TRACKING_URI
+                  value: "{{ include "mlflow.probeScheme" . | lower }}://{{ include "mlflow.service.fullhost" . }}:{{ .Values.service.port }}"
+                {{- if .Values.tls.enabled }}
+                - name: MLFLOW_TRACKING_INSECURE_TLS
+                  value: "false"
+                {{- end }}
+                - name: MLFLOW_TRACKING_AUTH
+                  value: "kubernetes"
+                {{- if .Values.caBundle.configMaps }}
+                - name: SSL_CERT_FILE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: REQUESTS_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: CURL_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: AWS_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: PGSSLROOTCERT
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: PGSSLMODE
+                  value: "verify-full"
+                - name: MLFLOW_MYSQL_SSL_CA
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: MLFLOW_S3_IGNORE_TLS
+                  value: "false"
+                {{- end }}
+                {{- range .Values.env }}
+                - name: {{ .name }}
+                  {{- if .valueFrom }}
+                  valueFrom:
+                    {{- toYaml .valueFrom | nindent 20 }}
+                  {{- else }}
+                  value: {{ .value | quote }}
+                  {{- end }}
+                {{- end }}
+              {{- if .Values.envFrom }}
+              envFrom:
+                {{- toYaml .Values.envFrom | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: trace-archival-config
+                  mountPath: /etc/mlflow
+                  readOnly: true
+                {{- if .Values.storage.enabled }}
+                - name: mlflow-storage
+                  mountPath: /mlflow
+                {{- end }}
+                {{- if .Values.caBundle.configMaps }}
+                - name: combined-ca-bundle
+                  mountPath: {{ dir .Values.caBundle.outputPath }}
+                  readOnly: true
+                {{- end }}
+              {{- with .Values.securityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.traceArchival.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+{{- end }}

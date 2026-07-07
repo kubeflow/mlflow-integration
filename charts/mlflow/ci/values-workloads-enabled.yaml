@@ -1,0 +1,42 @@
+# CI values that exercise all optional workload and TLS rendering paths.
+
+mlflow:
+  backendStoreUri: "postgresql://mlflow:password@postgresql/mlflow"
+  artifactsDestination: "s3://mlflow-artifacts"
+  allowedHosts:
+    - mlflow.example.com
+
+storage:
+  enabled: false
+
+tls:
+  enabled: true
+  secretName: mlflow-tls
+
+metrics:
+  enabled: true
+
+env:
+  - name: CI_ROOT_ENV
+    value: configured
+  - name: CI_ROOT_ENV_FROM
+    valueFrom:
+      secretKeyRef:
+        name: mlflow-runtime
+        key: token
+
+migrations:
+  enabled: true
+
+garbageCollection:
+  enabled: true
+
+traceArchival:
+  enabled: true
+  location: "s3://mlflow-trace-archive"
+  retention: "30d"
+
+caBundle:
+  configMaps:
+    - name: mlflow-custom-ca
+      mountPath: /etc/pki/custom-ca

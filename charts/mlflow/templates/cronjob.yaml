@@ -1,0 +1,150 @@
+{{- if .Values.garbageCollection.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "mlflow.gc.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gc
+spec:
+  schedule: {{ .Values.garbageCollection.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "mlflow.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: gc
+        spec:
+          serviceAccountName: {{ include "mlflow.gc.fullname" . }}
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          {{- with .Values.podSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 128Mi
+            {{- if .Values.storage.enabled }}
+            - name: mlflow-storage
+              persistentVolumeClaim:
+                claimName: {{ include "mlflow.fullname" . }}
+            {{- end }}
+            {{- include "mlflow.caBundleVolumes" . | nindent 12 }}
+          {{- include "mlflow.caBundleInitContainers" . | nindent 10 }}
+          containers:
+            - name: mlflow-gc
+              image: {{ include "mlflow.image" . }}
+              {{- if .Values.image.pullPolicy }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              {{- end }}
+              command:
+                - mlflow
+              args:
+                - gc
+                {{- if .Values.mlflow.backendStoreUriFrom }}
+                - --backend-store-uri=$(MLFLOW_BACKEND_STORE_URI)
+                {{- else }}
+                - --backend-store-uri={{ .Values.mlflow.backendStoreUri }}
+                {{- end }}
+                {{- if .Values.garbageCollection.olderThan }}
+                - --older-than={{ .Values.garbageCollection.olderThan }}
+                {{- end }}
+                - --all-workspaces
+              env:
+                - name: MLFLOW_DISABLE_TELEMETRY
+                  value: "true"
+                - name: MLFLOW_ENABLE_WORKSPACES
+                  value: "true"
+                - name: MLFLOW_WORKSPACE_STORE_URI
+                  value: {{ .Values.mlflow.workspaceStoreUri | quote }}
+                {{- if .Values.mlflow.workspaceLabelSelector }}
+                - name: MLFLOW_K8S_WORKSPACE_LABEL_SELECTOR
+                  value: {{ .Values.mlflow.workspaceLabelSelector | quote }}
+                {{- end }}
+                - name: MLFLOW_BACKEND_STORE_URI
+                  {{- if .Values.mlflow.backendStoreUriFrom }}
+                  valueFrom:
+                    {{- toYaml .Values.mlflow.backendStoreUriFrom | nindent 20 }}
+                  {{- else }}
+                  value: {{ .Values.mlflow.backendStoreUri | quote }}
+                  {{- end }}
+                - name: MLFLOW_TRACKING_URI
+                  value: "{{ include "mlflow.probeScheme" . | lower }}://{{ include "mlflow.service.fullhost" . }}:{{ .Values.service.port }}"
+                {{- if .Values.tls.enabled }}
+                - name: MLFLOW_TRACKING_INSECURE_TLS
+                  value: "false"
+                {{- end }}
+                - name: MLFLOW_TRACKING_AUTH
+                  value: "kubernetes"
+                {{- if .Values.caBundle.configMaps }}
+                - name: SSL_CERT_FILE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: REQUESTS_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: CURL_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: AWS_CA_BUNDLE
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: PGSSLROOTCERT
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: PGSSLMODE
+                  value: "verify-full"
+                - name: MLFLOW_MYSQL_SSL_CA
+                  value: {{ .Values.caBundle.outputPath | quote }}
+                - name: MLFLOW_S3_IGNORE_TLS
+                  value: "false"
+                {{- end }}
+                {{- range .Values.env }}
+                - name: {{ .name }}
+                  {{- if .valueFrom }}
+                  valueFrom:
+                    {{- toYaml .valueFrom | nindent 20 }}
+                  {{- else }}
+                  value: {{ .value | quote }}
+                  {{- end }}
+                {{- end }}
+              {{- if .Values.envFrom }}
+              envFrom:
+                {{- toYaml .Values.envFrom | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.storage.enabled }}
+                - name: mlflow-storage
+                  mountPath: /mlflow
+                {{- end }}
+                {{- if .Values.caBundle.configMaps }}
+                - name: combined-ca-bundle
+                  mountPath: {{ dir .Values.caBundle.outputPath }}
+                  readOnly: true
+                {{- end }}
+              {{- with .Values.securityContext }}
+              securityContext:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              {{- with .Values.garbageCollection.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+{{- end }}

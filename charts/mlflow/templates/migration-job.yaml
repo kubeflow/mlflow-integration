@@ -1,0 +1,132 @@
+{{- if .Values.migrations.enabled }}
+{{- if and (not .Values.mlflow.backendStoreUri) (empty .Values.mlflow.backendStoreUriFrom) }}
+{{- fail "migrations.enabled requires mlflow.backendStoreUri or mlflow.backendStoreUriFrom" }}
+{{- end }}
+{{- if and .Values.mlflow.backendStoreUri (hasPrefix "sqlite" .Values.mlflow.backendStoreUri) }}
+{{- fail "migrations.enabled is not needed for SQLite — it auto-migrates on server startup" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "mlflow.migration.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-migration
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-weight": "-5"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        {{- include "mlflow.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: db-migration
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: migration-script
+          configMap:
+            name: {{ include "mlflow.migration.fullname" . }}
+        {{- include "mlflow.caBundleVolumes" . | nindent 8 }}
+      {{- include "mlflow.caBundleInitContainers" . | nindent 6 }}
+      containers:
+        - name: db-migrate
+          image: {{ include "mlflow.image" . }}
+          {{- if .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- end }}
+          command:
+            - python
+            - /scripts/db_migrate.py
+          env:
+            - name: MLFLOW_BACKEND_STORE_URI
+              {{- if .Values.mlflow.backendStoreUriFrom }}
+              valueFrom:
+                {{- toYaml .Values.mlflow.backendStoreUriFrom | nindent 16 }}
+              {{- else }}
+              value: {{ .Values.mlflow.backendStoreUri | quote }}
+              {{- end }}
+            {{- if or .Values.mlflow.registryStoreUri .Values.mlflow.registryStoreUriFrom }}
+            - name: MLFLOW_REGISTRY_STORE_URI
+              {{- if .Values.mlflow.registryStoreUriFrom }}
+              valueFrom:
+                {{- toYaml .Values.mlflow.registryStoreUriFrom | nindent 16 }}
+              {{- else }}
+              value: {{ .Values.mlflow.registryStoreUri | quote }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.caBundle.configMaps }}
+            - name: SSL_CERT_FILE
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: REQUESTS_CA_BUNDLE
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: CURL_CA_BUNDLE
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: AWS_CA_BUNDLE
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: PGSSLROOTCERT
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: PGSSLMODE
+              value: "verify-full"
+            - name: MLFLOW_MYSQL_SSL_CA
+              value: {{ .Values.caBundle.outputPath | quote }}
+            - name: MLFLOW_S3_IGNORE_TLS
+              value: "false"
+            {{- end }}
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              {{- if .valueFrom }}
+              valueFrom:
+                {{- toYaml .valueFrom | nindent 16 }}
+              {{- else }}
+              value: {{ .value | quote }}
+              {{- end }}
+            {{- end }}
+          {{- if .Values.envFrom }}
+          envFrom:
+            {{- toYaml .Values.envFrom | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: migration-script
+              mountPath: /scripts
+              readOnly: true
+            {{- if .Values.caBundle.configMaps }}
+            - name: combined-ca-bundle
+              mountPath: {{ dir .Values.caBundle.outputPath }}
+              readOnly: true
+            {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.migrations.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}
