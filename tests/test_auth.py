@@ -67,27 +67,45 @@ from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
 from mlflow.server.workspace_helpers import WORKSPACE_HEADER_NAME
 from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
+    HAS_MLFLOW_3_14_AUTH_SURFACE,
     AddGuardrailToEndpoint,
+    AddItemsToReviewQueue,
     BatchGetTraceInfos,
     CreateGatewayBudgetPolicy,
     CreateGatewayGuardrail,
     CreateIssue,
+    CreateLabelSchema,
     CreatePresignedUploadUrl,
+    CreateReviewQueue,
     DeleteGatewayBudgetPolicy,
     DeleteGatewayGuardrail,
+    DeleteLabelSchema,
+    DeleteReviewQueue,
     GetGatewayBudgetPolicy,
     GetGatewayGuardrail,
     GetIssue,
+    GetLabelSchema,
+    GetLabelSchemaByName,
+    GetOrCreateUserQueue,
     GetPresignedDownloadUrl,
+    GetReviewQueue,
+    GetReviewQueueByName,
     ListEndpointGuardrailConfigs,
     ListGatewayBudgetPolicies,
     ListGatewayBudgetWindows,
     ListGatewayGuardrails,
+    ListLabelSchemas,
+    ListReviewQueueItems,
+    ListReviewQueues,
     RemoveGuardrailFromEndpoint,
+    RemoveItemsFromReviewQueue,
     SearchIssues,
+    SetReviewQueueItemStatus,
     UpdateEndpointGuardrailConfig,
     UpdateGatewayBudgetPolicy,
     UpdateIssue,
+    UpdateLabelSchema,
+    UpdateReviewQueue,
 )
 from mlflow_kubernetes_plugins.auth.authorizer import (
     AuthorizationMode,
@@ -3147,6 +3165,61 @@ def test_mlflow_313_request_authorization_rules_cover_cross_experiment_list_scor
     )
 
 
+def test_mlflow_314_request_authorization_rules_cover_new_endpoints():
+    if not HAS_MLFLOW_3_14_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.14 request classes.")
+
+    experiment_id_parsers = (RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
+
+    label_schema_rules = {
+        CreateLabelSchema: AuthorizationRule(
+            "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        GetLabelSchema: AuthorizationRule("get", resource=RESOURCE_EXPERIMENTS),
+        GetLabelSchemaByName: AuthorizationRule(
+            "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        ListLabelSchemas: AuthorizationRule(
+            "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        UpdateLabelSchema: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+        DeleteLabelSchema: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+    }
+    for request_class, expected_rule in label_schema_rules.items():
+        assert REQUEST_AUTHORIZATION_RULES[request_class] == expected_rule
+
+    review_queue_rules = {
+        CreateReviewQueue: AuthorizationRule(
+            "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        GetOrCreateUserQueue: AuthorizationRule(
+            "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        GetReviewQueue: AuthorizationRule("get", resource=RESOURCE_EXPERIMENTS),
+        GetReviewQueueByName: AuthorizationRule(
+            "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        ListReviewQueues: AuthorizationRule(
+            "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+        ),
+        UpdateReviewQueue: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+        DeleteReviewQueue: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+        AddItemsToReviewQueue: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+        RemoveItemsFromReviewQueue: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+        ListReviewQueueItems: AuthorizationRule("get", resource=RESOURCE_EXPERIMENTS),
+        SetReviewQueueItemStatus: AuthorizationRule("update", resource=RESOURCE_EXPERIMENTS),
+    }
+    for request_class, expected_rule in review_queue_rules.items():
+        assert REQUEST_AUTHORIZATION_RULES[request_class] == expected_rule
+
+    genai_evaluate_rule = PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/genai/evaluate/invoke", "POST")
+    ]
+    assert genai_evaluate_rule == AuthorizationRule(
+        "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=experiment_id_parsers
+    )
+
+
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
     get_job_rule = PATH_AUTHORIZATION_RULES[("/ajax-api/3.0/mlflow/jobs/<job_id>", "GET")]
     cancel_job_rule = PATH_AUTHORIZATION_RULES[
@@ -4658,6 +4731,8 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
     ]
     if HAS_MLFLOW_3_13_AUTH_SURFACE:
         routes.append(("/gateway/proxy/<endpoint_name>/<path:path>", "POST"))
+    if HAS_MLFLOW_3_14_AUTH_SURFACE:
+        routes.append(("/gateway/openai/v1/responses/compact", "POST"))
 
     for route in routes:
         rule = PATH_AUTHORIZATION_RULES[route]
