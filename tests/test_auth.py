@@ -66,6 +66,7 @@ from mlflow.protos.webhooks_pb2 import DeleteWebhook, GetWebhook, UpdateWebhook
 from mlflow.server.handlers import STATIC_PREFIX_ENV_VAR
 from mlflow.server.workspace_helpers import WORKSPACE_HEADER_NAME
 from mlflow_kubernetes_plugins.auth._compat import (
+    HAS_MCP_REGISTRY,
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     AddGuardrailToEndpoint,
@@ -120,6 +121,8 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
     COLLECTION_POLICY_RESPONSE_SCORERS,
     COLLECTION_POLICY_RESPONSE_TRACES,
     apply_request_collection_filter,
@@ -144,6 +147,7 @@ from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_GATEWAY_GUARDRAILS,
     RESOURCE_GATEWAY_MODEL_DEFINITIONS,
     RESOURCE_GATEWAY_SECRETS,
+    RESOURCE_MCP_SERVERS,
     RESOURCE_REGISTERED_MODELS,
     WORKSPACES_ENABLED_ENV,
 )
@@ -161,6 +165,7 @@ from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,
     RESOURCE_NAME_PARSER_DATASET_ID_TO_NAME,
+    RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,
     RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,
     RESOURCE_NAME_PARSER_EXPERIMENT_IDS_TO_NAMES,
     RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_ID_TO_NAME,
@@ -169,6 +174,7 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,
     RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME,
     RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME,
+    RESOURCE_NAME_PARSER_MCP_SERVER_NAME,
     RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME,
     RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME,
     RESOURCE_NAME_PARSER_OPTIONAL_ACTION_ENDPOINT_ID_TO_NAME,
@@ -189,6 +195,10 @@ from mlflow_kubernetes_plugins.auth.rules import (
     REQUEST_AUTHORIZATION_RULES,
     AuthorizationRule,
     _normalize_rules,
+)
+from mlflow_kubernetes_plugins.auth.rules_v3_14 import (
+    apply_mcp_registry_deltas,
+    apply_v3_14_deltas,
 )
 
 from conftest import _authorize_request
@@ -1856,6 +1866,99 @@ def test_authorize_request_retries_with_resource_name_after_broad_denial(monkeyp
     second_call = authorizer.is_allowed.call_args_list[1]
     assert second_call.args[1:] == (RESOURCE_EXPERIMENTS, "get", "team-a", None)
     assert second_call.kwargs == {"resource_name": "exp-a"}
+
+
+def test_authorize_request_allows_mcp_version_create_with_broad_create_for_new_server(monkeypatch):
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = True
+    rule = AuthorizationRule(
+        "create",
+        resource=RESOURCE_MCP_SERVERS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,),
+        resource_name_verb="update",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    get_tracking_store = Mock()
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        get_tracking_store,
+    )
+
+    _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer create-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/api/3.0/mlflow/mcp-servers/com.example/server/versions",
+            method="POST",
+            workspace="team-a",
+            path_params={"name": "com.example/server"},
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    authorizer.is_allowed.assert_called_once()
+    broad_call = authorizer.is_allowed.call_args_list[0]
+    assert broad_call.args[1:] == (RESOURCE_MCP_SERVERS, "create", "team-a", None)
+    assert broad_call.kwargs == {}
+    get_tracking_store.assert_not_called()
+
+
+def test_authorize_request_retries_mcp_version_create_with_named_update_for_existing_server(
+    monkeypatch,
+):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = [False, True]
+    rule = AuthorizationRule(
+        "create",
+        resource=RESOURCE_MCP_SERVERS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,),
+        resource_name_verb="update",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [rule],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: SimpleNamespace(get_mcp_server=lambda name: SimpleNamespace(name=name)),
+    )
+
+    _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer update-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/api/3.0/mlflow/mcp-servers/com.example/server/versions",
+            method="POST",
+            workspace="team-a",
+            path_params={"name": "com.example/server"},
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    first_call = authorizer.is_allowed.call_args_list[0]
+    assert first_call.args[1:] == (RESOURCE_MCP_SERVERS, "create", "team-a", None)
+    assert first_call.kwargs == {}
+
+    second_call = authorizer.is_allowed.call_args_list[1]
+    assert second_call.args[1:] == (RESOURCE_MCP_SERVERS, "update", "team-a", None)
+    assert second_call.kwargs == {"resource_name": "com.example/server"}
 
 
 def test_resolve_resource_names_resolves_experiment_ids_to_names(monkeypatch):
@@ -4209,6 +4312,64 @@ def test_apply_response_collection_filters_filters_experiments():
     assert filtered == {"experiments": [{"experiment_id": "1", "name": "exp-a"}]}
 
 
+def test_apply_response_collection_filters_filters_mcp_servers():
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "com.test/visible"
+    )
+
+    filtered, enforceable = apply_response_collection_filters(
+        {
+            "mcp_servers": [
+                {"name": "com.test/visible"},
+                {"name": "com.test/hidden"},
+            ]
+        },
+        [
+            AuthorizationRule(
+                "list",
+                resource=RESOURCE_MCP_SERVERS,
+                collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+            )
+        ],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert enforceable is True
+    assert filtered == {"mcp_servers": [{"name": "com.test/visible"}]}
+
+
+def test_apply_response_collection_filters_filters_mcp_access_endpoints():
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "com.test/visible"
+    )
+
+    filtered, enforceable = apply_response_collection_filters(
+        {
+            "mcp_access_endpoints": [
+                {"id": "ep-1", "server_name": "com.test/visible"},
+                {"id": "ep-2", "server_name": "com.test/hidden"},
+            ]
+        },
+        [
+            AuthorizationRule(
+                "list",
+                resource=RESOURCE_MCP_SERVERS,
+                collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+            )
+        ],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert enforceable is True
+    assert filtered == {"mcp_access_endpoints": [{"id": "ep-1", "server_name": "com.test/visible"}]}
+
+
 def test_apply_response_collection_filters_filters_scorers(monkeypatch):
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
@@ -4417,16 +4578,18 @@ def test_can_access_workspace_iterates_priority_resources(monkeypatch):
     calls = authorizer.is_allowed.call_args_list
     assert calls[0][0][1] == RESOURCE_EXPERIMENTS
     assert calls[1][0][1] == RESOURCE_DATASETS
-    assert calls[2][0][1] == RESOURCE_REGISTERED_MODELS
+    assert calls[2][0][1] == RESOURCE_MCP_SERVERS
+    assert calls[3][0][1] == RESOURCE_REGISTERED_MODELS
 
     authorizer.is_allowed.reset_mock()
     assert authorizer.can_access_workspace(identity, "team-b", verb="get") is False
 
     calls = authorizer.is_allowed.call_args_list
-    assert len(calls) == 8
+    assert len(calls) == 9
     assert [c[0][1] for c in calls] == [
         RESOURCE_EXPERIMENTS,
         RESOURCE_DATASETS,
+        RESOURCE_MCP_SERVERS,
         RESOURCE_REGISTERED_MODELS,
         RESOURCE_GATEWAY_SECRETS,
         RESOURCE_GATEWAY_ENDPOINTS,
@@ -4675,6 +4838,206 @@ def test_assistant_endpoints_use_assistants_resource():
         rule = PATH_AUTHORIZATION_RULES[route]
         assert isinstance(rule, AuthorizationRule), route
         assert (rule.verb, rule.resource) == (expected_verb, RESOURCE_ASSISTANTS), route
+
+
+def test_mcp_server_name_parser_uses_path_param():
+    request_context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers/com.test/demo-server/versions",
+        method="POST",
+        workspace="team-a",
+        path_params={"name": "com.test/demo-server"},
+    )
+
+    assert resolve_resource_names(request_context, [RESOURCE_NAME_PARSER_MCP_SERVER_NAME]) == (
+        "com.test/demo-server",
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "query_params", "json_body"),
+    [
+        ("GET", {"name": "spoofed"}, None),
+        ("PATCH", {}, {"name": "spoofed"}),
+        ("POST", {}, {"name": "spoofed"}),
+        ("DELETE", {"name": "spoofed"}, None),
+    ],
+)
+def test_mcp_server_name_parser_prefers_path_param_over_query_or_body(
+    method, query_params, json_body
+):
+    request_context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers/com.test/demo-server/versions",
+        method=method,
+        workspace="team-a",
+        path_params={"name": "com.test/demo-server"},
+        query_params=query_params,
+        json_body=json_body,
+    )
+
+    assert resolve_resource_names(request_context, [RESOURCE_NAME_PARSER_MCP_SERVER_NAME]) == (
+        "com.test/demo-server",
+    )
+
+
+def test_existing_mcp_server_name_parser_requires_existing_server(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: SimpleNamespace(get_mcp_server=lambda name: SimpleNamespace(name=name)),
+    )
+    request_context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers/com.test/demo-server/versions",
+        method="POST",
+        workspace="team-a",
+        path_params={"name": "com.test/demo-server"},
+    )
+
+    assert resolve_resource_names(
+        request_context, [RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME]
+    ) == ("com.test/demo-server",)
+
+
+def test_mcp_server_path_rules_use_mcpservers_resource():
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    cases = [
+        (("/api/3.0/mlflow/mcp-servers", "POST"), "create", (), None, None),
+        (
+            ("/api/3.0/mlflow/mcp-servers", "GET"),
+            "list",
+            (),
+            COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/endpoints", "GET"),
+            "list",
+            (),
+            COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"),
+            "create",
+            (RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,),
+            None,
+            "update",
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/tags", "POST"),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>", "DELETE"),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            (
+                "/api/3.0/mlflow/mcp-servers/<path:name>/versions/<path:version>/tags/<path:key>",
+                "DELETE",
+            ),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>", "DELETE"),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/tags/<path:key>", "DELETE"),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>", "DELETE"),
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+    ]
+
+    for (
+        route,
+        expected_verb,
+        expected_parsers,
+        expected_policy,
+        expected_resource_name_verb,
+    ) in cases:
+        rule = PATH_AUTHORIZATION_RULES[route]
+        assert isinstance(rule, AuthorizationRule)
+        assert (rule.verb, rule.resource) == (expected_verb, RESOURCE_MCP_SERVERS)
+        assert rule.resource_name_parsers == expected_parsers
+        assert rule.collection_policy == expected_policy
+        assert rule.resource_name_verb == expected_resource_name_verb
+
+
+def test_find_authorization_rules_prefers_nested_mcp_routes():
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    rules = _find_authorization_rules(
+        "/api/3.0/mlflow/mcp-servers/com.test/demo-server/versions/1.0.0",
+        "GET",
+    )
+
+    assert rules is not None
+    assert len(rules) == 1
+    assert rules[0].verb == "get"
+    assert rules[0].resource == RESOURCE_MCP_SERVERS
+    assert rules[0].resource_name_parsers == (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,)
+
+
+def test_apply_mcp_registry_deltas_registers_routes_independently():
+    path_authorization_rules = {}
+
+    apply_mcp_registry_deltas(path_authorization_rules=path_authorization_rules)
+
+    assert ("/api/3.0/mlflow/mcp-servers", "POST") in path_authorization_rules
+    assert ("/ajax-api/3.0/mlflow/mcp-servers", "GET") in path_authorization_rules
+    assert (
+        path_authorization_rules[("/api/3.0/mlflow/mcp-servers", "POST")].resource
+        == RESOURCE_MCP_SERVERS
+    )
+
+
+def test_apply_v3_14_deltas_skips_mcp_rules_without_registry(monkeypatch):
+    request_authorization_rules = {}
+    path_authorization_rules = {}
+    monkeypatch.setattr("mlflow_kubernetes_plugins.auth.rules_v3_14.HAS_MCP_REGISTRY", False)
+
+    apply_v3_14_deltas(
+        request_authorization_rules=request_authorization_rules,
+        path_authorization_rules=path_authorization_rules,
+    )
+
+    assert ("/api/3.0/mlflow/mcp-servers", "POST") not in path_authorization_rules
+    assert ("/ajax-api/3.0/mlflow/genai/evaluate/invoke", "POST") in path_authorization_rules
 
 
 def test_gateway_request_rules_use_resource_name_parsers():

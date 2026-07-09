@@ -18,6 +18,7 @@ from mlflow.protos import databricks_pb2
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 from mlflow.utils import workspace_context
 from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
+from mlflow_kubernetes_plugins.auth._compat import HAS_MCP_REGISTRY
 from mlflow_kubernetes_plugins.auth.authorizer import (
     AuthorizationMode,
     KubernetesAuthConfig,
@@ -25,16 +26,21 @@ from mlflow_kubernetes_plugins.auth.authorizer import (
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
 )
 from mlflow_kubernetes_plugins.auth.compiler import _validate_fastapi_route_authorization
 from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_GROUPS_HEADER,
     DEFAULT_REMOTE_GROUPS_SEPARATOR,
     DEFAULT_REMOTE_USER_HEADER,
+    RESOURCE_MCP_SERVERS,
 )
 from mlflow_kubernetes_plugins.auth.core import _AUTHORIZATION_HANDLED
 from mlflow_kubernetes_plugins.auth.middleware import KubernetesAuthMiddleware
 from mlflow_kubernetes_plugins.auth.resource_names import (
+    RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,
+    RESOURCE_NAME_PARSER_MCP_SERVER_NAME,
     RESOURCE_NAME_PARSER_TRACE_V3_EXPERIMENT_ID_TO_NAME,
 )
 from mlflow_kubernetes_plugins.auth.rules import (
@@ -83,6 +89,120 @@ def test_job_api_endpoints_in_auth_rules():
     for path, method, verb in cases:
         rule = PATH_AUTHORIZATION_RULES[(path, method)]
         assert (rule.verb, rule.resource) == (verb, "experiments")
+
+
+def test_mcp_registry_endpoints_in_auth_rules():
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    cases = [
+        ("/api/3.0/mlflow/mcp-servers", "POST", "create", (), None, None),
+        (
+            "/api/3.0/mlflow/mcp-servers",
+            "GET",
+            "list",
+            (),
+            COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+            None,
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/endpoints",
+            "GET",
+            "list",
+            (),
+            COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+            None,
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/<path:name>",
+            "PATCH",
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/<path:name>/versions",
+            "POST",
+            "create",
+            (RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,),
+            None,
+            "update",
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/<path:name>/endpoints/<endpoint_id>",
+            "DELETE",
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>",
+            "DELETE",
+            "update",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+        (
+            "/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>",
+            "GET",
+            "get",
+            (RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            None,
+            None,
+        ),
+    ]
+
+    for (
+        path,
+        method,
+        expected_verb,
+        expected_parsers,
+        expected_policy,
+        expected_resource_name_verb,
+    ) in cases:
+        rule = PATH_AUTHORIZATION_RULES[(path, method)]
+        assert isinstance(rule, AuthorizationRule)
+        assert (rule.verb, rule.resource) == (expected_verb, RESOURCE_MCP_SERVERS)
+        assert rule.resource_name_parsers == expected_parsers
+        assert rule.collection_policy == expected_policy
+        assert rule.resource_name_verb == expected_resource_name_verb
+
+
+def test_synthetic_mcp_fastapi_routes_require_exact_auth_templates():
+    app = FastAPI()
+
+    @app.post("/api/3.0/mlflow/mcp-servers/{name:path}/versions")
+    async def _create_version():
+        return {}
+
+    @app.get("/api/3.0/mlflow/mcp-servers/{name:path}/aliases/{alias:path}")
+    async def _get_alias():
+        return {}
+
+    with patch.dict(
+        PATH_AUTHORIZATION_RULES,
+        {
+            ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"): AuthorizationRule(
+                "create",
+                resource=RESOURCE_MCP_SERVERS,
+                resource_name_parsers=(RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,),
+                resource_name_verb="update",
+            ),
+            (
+                "/api/3.0/mlflow/mcp-servers/<path:name>/aliases/<path:alias>",
+                "GET",
+            ): AuthorizationRule(
+                "get",
+                resource=RESOURCE_MCP_SERVERS,
+                resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+            ),
+        },
+        clear=False,
+    ):
+        _validate_fastapi_route_authorization(app)
 
 
 def test_fastapi_auth_leaves_non_json_bodies_unloaded(monkeypatch) -> None:
@@ -315,7 +435,7 @@ def fastapi_app_with_k8s_auth(mock_authorizer, mock_config):
         }
 
     # Add a mock Job API endpoint (should be processed by K8s middleware)
-    @app.get("/ajax-api/3.0/jobs/123")
+    @app.get("/ajax-api/3.0/jobs/{job_id}")
     async def mock_job_endpoint(request: Request):
         workspace_name = workspace_context.get_request_workspace()
         return {
@@ -497,7 +617,7 @@ def test_job_api_endpoints_with_root_path_require_auth(mock_authorizer, mock_con
 
     app.add_middleware(_WorkspaceContextMiddleware)
 
-    @app.get("/ajax-api/3.0/jobs/123")
+    @app.get("/ajax-api/3.0/jobs/{job_id}")
     async def mock_job_endpoint(_request: Request):
         return {"status": "job_endpoint"}
 
@@ -1115,7 +1235,7 @@ def test_job_api_missing_workspace_context_returns_error(
         lambda _header: None,
     )
 
-    @app.get("/ajax-api/3.0/jobs/123")
+    @app.get("/ajax-api/3.0/jobs/{job_id}")
     async def job_endpoint():
         return {"status": "job_endpoint"}
 
@@ -1147,6 +1267,17 @@ def test_fastapi_route_validation_fails_for_missing_rule():
         return {}
 
     with pytest.raises(MlflowException, match="FastAPI endpoints"):
+        _validate_fastapi_route_authorization(app)
+
+
+def test_fastapi_route_validation_rejects_unknown_nested_mcp_route():
+    app = FastAPI()
+
+    @app.get("/api/3.0/mlflow/mcp-servers/{name:path}/unlisted-child")
+    async def _missing_nested():
+        return {}
+
+    with pytest.raises(MlflowException, match="mcp-servers/.*/unlisted-child"):
         _validate_fastapi_route_authorization(app)
 
 

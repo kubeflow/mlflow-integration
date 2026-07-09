@@ -234,7 +234,15 @@ _TEMPLATE_TOKEN_PATTERN = re.compile(r"<[^>]+>|{[^}]+}")
 
 def _fastapi_path_to_template(path: str) -> str:
     """Convert FastAPI-style `{param}` segments into Flask-style `<param>` tokens."""
-    return re.sub(r"{([^}]+)}", r"<\1>", path)
+
+    def _replace_token(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if ":" in token:
+            name, converter = token.split(":", 1)
+            return f"<{converter}:{name}>"
+        return f"<{token}>"
+
+    return re.sub(r"{([^}]+)}", _replace_token, path)
 
 
 def _templated_path_to_probe(path: str, placeholder: str = "probe") -> str:
@@ -758,11 +766,12 @@ async def _authorize_request_async(
                     resource_names = ()
                 except ResourceNameResolutionError:
                     resource_names = ()
+                resource_name_verb = rule.resource_name_verb or rule.verb
                 has_permission = bool(resource_names) and all(
                     authorizer.is_allowed(
                         identity,
                         rule.resource,
-                        rule.verb,
+                        resource_name_verb,
                         resolved_workspace_name,
                         rule.subresource,
                         resource_name=resource_name,
