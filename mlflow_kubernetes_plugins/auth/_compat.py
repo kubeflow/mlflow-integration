@@ -13,6 +13,7 @@ MLFLOW_VERSION = Version(mlflow.__version__)
 HAS_MLFLOW_3_11_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.11.0.dev0")
 HAS_MLFLOW_3_12_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.12.0.dev0")
 HAS_MLFLOW_3_13_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.13.0.dev0")
+HAS_MLFLOW_3_14_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.14.0.dev0")
 
 if HAS_MLFLOW_3_11_AUTH_SURFACE:
     GetPresignedDownloadUrl = artifacts_pb2.GetPresignedDownloadUrl
@@ -62,30 +63,76 @@ else:  # pragma: no cover - exercised via MLflow version matrix
     ListEndpointGuardrailConfigs = None
     UpdateEndpointGuardrailConfig = None
 
+if HAS_MLFLOW_3_14_AUTH_SURFACE:
+    label_schemas_pb2 = importlib.import_module("mlflow.protos.label_schemas_pb2")
+    CreateLabelSchema = label_schemas_pb2.CreateLabelSchema
+    GetLabelSchema = label_schemas_pb2.GetLabelSchema
+    GetLabelSchemaByName = label_schemas_pb2.GetLabelSchemaByName
+    ListLabelSchemas = label_schemas_pb2.ListLabelSchemas
+    UpdateLabelSchema = label_schemas_pb2.UpdateLabelSchema
+    DeleteLabelSchema = label_schemas_pb2.DeleteLabelSchema
+    review_queues_pb2 = importlib.import_module("mlflow.protos.review_queues_pb2")
+    CreateReviewQueue = review_queues_pb2.CreateReviewQueue
+    GetOrCreateUserQueue = review_queues_pb2.GetOrCreateUserQueue
+    GetReviewQueue = review_queues_pb2.GetReviewQueue
+    GetReviewQueueByName = review_queues_pb2.GetReviewQueueByName
+    ListReviewQueues = review_queues_pb2.ListReviewQueues
+    UpdateReviewQueue = review_queues_pb2.UpdateReviewQueue
+    DeleteReviewQueue = review_queues_pb2.DeleteReviewQueue
+    AddItemsToReviewQueue = review_queues_pb2.AddItemsToReviewQueue
+    RemoveItemsFromReviewQueue = review_queues_pb2.RemoveItemsFromReviewQueue
+    ListReviewQueueItems = review_queues_pb2.ListReviewQueueItems
+    SetReviewQueueItemStatus = review_queues_pb2.SetReviewQueueItemStatus
+else:  # pragma: no cover - exercised via MLflow version matrix
+    CreateLabelSchema = GetLabelSchema = GetLabelSchemaByName = None
+    ListLabelSchemas = UpdateLabelSchema = DeleteLabelSchema = None
+    CreateReviewQueue = GetOrCreateUserQueue = GetReviewQueue = None
+    GetReviewQueueByName = ListReviewQueues = UpdateReviewQueue = None
+    DeleteReviewQueue = AddItemsToReviewQueue = RemoveItemsFromReviewQueue = None
+    ListReviewQueueItems = SetReviewQueueItemStatus = None
+
 __all__ = [
     "AddGuardrailToEndpoint",
+    "AddItemsToReviewQueue",
     "BatchGetTraceInfos",
     "CreateGatewayGuardrail",
     "CreateGatewayBudgetPolicy",
     "CreateIssue",
+    "CreateLabelSchema",
     "CreatePresignedUploadUrl",
+    "CreateReviewQueue",
     "DeleteGatewayGuardrail",
     "DeleteGatewayBudgetPolicy",
+    "DeleteLabelSchema",
+    "DeleteReviewQueue",
     "GetGatewayGuardrail",
     "GetGatewayBudgetPolicy",
     "GetIssue",
+    "GetLabelSchema",
+    "GetLabelSchemaByName",
+    "GetOrCreateUserQueue",
     "GetPresignedDownloadUrl",
+    "GetReviewQueue",
+    "GetReviewQueueByName",
     "HAS_MLFLOW_3_11_AUTH_SURFACE",
     "HAS_MLFLOW_3_12_AUTH_SURFACE",
     "HAS_MLFLOW_3_13_AUTH_SURFACE",
+    "HAS_MLFLOW_3_14_AUTH_SURFACE",
     "ListEndpointGuardrailConfigs",
     "ListGatewayGuardrails",
     "ListGatewayBudgetPolicies",
     "ListGatewayBudgetWindows",
+    "ListLabelSchemas",
+    "ListReviewQueueItems",
+    "ListReviewQueues",
     "MLFLOW_VERSION",
     "RemoveGuardrailFromEndpoint",
+    "RemoveItemsFromReviewQueue",
     "SearchIssues",
+    "SetReviewQueueItemStatus",
     "UpdateEndpointGuardrailConfig",
     "UpdateGatewayBudgetPolicy",
     "UpdateIssue",
+    "UpdateLabelSchema",
+    "UpdateReviewQueue",
 ]
