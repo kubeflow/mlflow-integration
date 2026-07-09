@@ -42,6 +42,7 @@ rules:
       - assistants
       - datasets
       - experiments
+      - mcpservers
       - registeredmodels
       - gatewaysecrets
       - gatewayendpoints

@@ -21,6 +21,7 @@ The authorization plugin checks access against resources in the `mlflow.kubeflow
 | `assistants` | `get`, `create`, `update` |
 | `datasets` | `get`, `list`, `create`, `update`, `delete` |
 | `experiments` | `get`, `list`, `create`, `update`, `delete` |
+| `mcpservers` | `get`, `list`, `create`, `update`, `delete` |
 | `registeredmodels` | `get`, `list`, `create`, `update`, `delete` |
 | `gatewaysecrets` | `get`, `list`, `create`, `update`, `delete` |
 | `gatewaysecrets/use` | `create` |
@@ -45,6 +46,7 @@ Important details:
 - Use the MLflow resource name, not the MLflow ID
 - For `datasets`, the `resourceName` is the dataset name
 - For `experiments`, the `resourceName` is the experiment name
+- For `mcpservers`, the `resourceName` is the MCP server name
 - For `registeredmodels`, the `resourceName` is the registered model name
 - For `gatewaysecrets`, the `resourceName` is the gateway secret name
 - For `gatewayendpoints`, the `resourceName` is the gateway endpoint name
@@ -60,7 +62,7 @@ Important details:
 
 This is most useful for single-object operations such as:
 
-- reading a specific dataset, experiment, registered model, or gateway resource
+- reading a specific dataset, experiment, MCP server, registered model, or gateway resource
 - creating or updating runs, traces, tags, scorers, and other experiment-scoped writes
 - creating or updating model versions, webhooks, and many gateway resources by name
 - reading artifacts or trace details that resolve back to one experiment
@@ -68,6 +70,7 @@ This is most useful for single-object operations such as:
 Collection endpoints behave differently:
 
 - many search and list endpoints now filter request inputs or response items down to the readable experiments
+- MCP registry collection responses filter server and binding items down to the readable MCP servers
 - some endpoints still require broader `list` access and may return `Permission denied` for callers that only have named resources
 
 Use the example manifest below as a starting point for both broad workspace access and name-scoped experiment access:

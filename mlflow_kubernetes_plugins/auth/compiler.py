@@ -19,7 +19,6 @@ from mlflow_kubernetes_plugins.auth.core import (
     _fastapi_path_to_template,
     _is_unprotected_path,
     _re_compile_path,
-    _templated_path_to_probe,
     _unwrap_handler,
 )
 from mlflow_kubernetes_plugins.auth.graphql import (
@@ -175,14 +174,11 @@ def _validate_fastapi_route_authorization(fastapi_app: FastAPI) -> None:
         if not canonical_path or _is_unprotected_path(canonical_path):
             continue
         template_path = _fastapi_path_to_template(canonical_path)
-        # Use a concrete probe path so _find_authorization_rules follows the same regex path
-        # matching logic that real requests do.
-        probe_path = _templated_path_to_probe(template_path)
 
         for method in methods:
             if method in {"HEAD", "OPTIONS"}:
                 continue
-            if _find_authorization_rules(probe_path, method) is None:
+            if PATH_AUTHORIZATION_RULES.get((template_path, method)) is None:
                 missing.append((method, canonical_path))
 
     if missing:

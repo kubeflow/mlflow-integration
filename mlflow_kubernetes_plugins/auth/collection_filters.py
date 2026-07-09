@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_EXPERIMENTS,
+    RESOURCE_MCP_SERVERS,
     RESOURCE_REGISTERED_MODELS,
 )
 from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
@@ -31,12 +32,15 @@ COLLECTION_POLICY_REQUEST_RUN_IDS = "request_filter_run_ids"
 COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS = "request_filter_trace_locations"
 COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES = "response_filter_dataset_summaries"
 COLLECTION_POLICY_RESPONSE_EXPERIMENTS = "response_filter_experiments"
+COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS = "response_filter_mcp_access_endpoints"
+COLLECTION_POLICY_RESPONSE_MCP_SERVERS = "response_filter_mcp_servers"
 COLLECTION_POLICY_RESPONSE_SCORERS = "response_filter_scorers"
 COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS = "response_filter_registered_models"
 COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS = "response_filter_model_versions"
 COLLECTION_POLICY_RESPONSE_TRACES = "response_filter_traces"
 
 _EXPERIMENT_READ_RULE = (RESOURCE_EXPERIMENTS, "get")
+_MCP_SERVER_READ_RULE = (RESOURCE_MCP_SERVERS, "get")
 _REGISTERED_MODEL_READ_RULE = (RESOURCE_REGISTERED_MODELS, "get")
 
 _REQUEST_FILTER_POLICIES = {
@@ -48,6 +52,8 @@ _REQUEST_FILTER_POLICIES = {
 _RESPONSE_FILTER_POLICIES = {
     COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
     COLLECTION_POLICY_RESPONSE_SCORERS,
     COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
     COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
@@ -533,6 +539,60 @@ def _filter_payload_registered_models(
     return True
 
 
+def _filter_payload_mcp_servers(
+    payload: dict[str, object],
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> bool:
+    mcp_servers = payload.get("mcp_servers")
+    if mcp_servers is None:
+        return True
+    if not isinstance(mcp_servers, list):
+        return False
+    payload["mcp_servers"] = [
+        server
+        for server in mcp_servers
+        if isinstance(server, dict)
+        and (server_name := _normalize_string(server.get("name")))
+        and _is_allowed_named_resource(
+            authorizer,
+            identity,
+            workspace_name,
+            _MCP_SERVER_READ_RULE,
+            server_name,
+        )
+    ]
+    return True
+
+
+def _filter_payload_mcp_access_endpoints(
+    payload: dict[str, object],
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> bool:
+    endpoints = payload.get("mcp_access_endpoints")
+    if endpoints is None:
+        return True
+    if not isinstance(endpoints, list):
+        return False
+    payload["mcp_access_endpoints"] = [
+        endpoint
+        for endpoint in endpoints
+        if isinstance(endpoint, dict)
+        and (server_name := _normalize_string(endpoint.get("server_name")))
+        and _is_allowed_named_resource(
+            authorizer,
+            identity,
+            workspace_name,
+            _MCP_SERVER_READ_RULE,
+            server_name,
+        )
+    ]
+    return True
+
+
 def _filter_payload_scorers(
     payload: dict[str, object],
     authorizer: "KubernetesAuthorizer",
@@ -660,6 +720,14 @@ def apply_response_collection_filters(
             enforceable &= _filter_payload_experiments(
                 filtered_payload, authorizer, identity, workspace_name
             )
+        elif policy == COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS:
+            enforceable &= _filter_payload_mcp_access_endpoints(
+                filtered_payload, authorizer, identity, workspace_name
+            )
+        elif policy == COLLECTION_POLICY_RESPONSE_MCP_SERVERS:
+            enforceable &= _filter_payload_mcp_servers(
+                filtered_payload, authorizer, identity, workspace_name
+            )
         elif policy == COLLECTION_POLICY_RESPONSE_SCORERS:
             enforceable &= _filter_payload_scorers(
                 filtered_payload, authorizer, identity, workspace_name
@@ -723,6 +791,8 @@ __all__ = [
     "COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS",
     "COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES",
     "COLLECTION_POLICY_RESPONSE_EXPERIMENTS",
+    "COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS",
+    "COLLECTION_POLICY_RESPONSE_MCP_SERVERS",
     "COLLECTION_POLICY_RESPONSE_SCORERS",
     "COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS",
     "COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS",
