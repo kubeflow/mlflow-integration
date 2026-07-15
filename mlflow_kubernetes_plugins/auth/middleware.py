@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import atexit
 import copy
+import importlib
 import json
 import logging
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlencode
 
 from fastapi import Request
@@ -18,6 +19,7 @@ from mlflow.server import handlers as mlflow_handlers
 from mlflow.server.fastapi_app import create_fastapi_app
 from mlflow.server.workspace_helpers import WORKSPACE_HEADER_NAME, resolve_workspace_from_header
 from mlflow.utils import workspace_context
+from mlflow.utils.search_utils import SearchUtils
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import QueryParams
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -35,11 +37,13 @@ from mlflow_kubernetes_plugins.auth.compiler import (
     _extract_path_params,
     _validate_fastapi_route_authorization,
 )
+from mlflow_kubernetes_plugins.auth.constants import RESOURCE_MCP_SERVERS
 from mlflow_kubernetes_plugins.auth.core import (
     _AUTHORIZATION_HANDLED,
     _authorize_request_async,
     _canonicalize_path,
     _is_unprotected_path,
+    _RequestIdentity,
 )
 from mlflow_kubernetes_plugins.auth.graphql import (
     get_graphql_authorization_middleware as _get_graphql_authorization_middleware,
@@ -47,7 +51,10 @@ from mlflow_kubernetes_plugins.auth.graphql import (
 from mlflow_kubernetes_plugins.auth.graphql import (
     validate_graphql_field_authorization as _validate_graphql_field_authorization,
 )
-from mlflow_kubernetes_plugins.auth.request_context import build_fastapi_authorization_request
+from mlflow_kubernetes_plugins.auth.request_context import (
+    AuthorizationRequest,
+    build_fastapi_authorization_request,
+)
 from mlflow_kubernetes_plugins.auth.resource_names import apply_response_cache_updates
 
 if TYPE_CHECKING:
@@ -72,6 +79,213 @@ def _replace_scope_headers(scope: Scope, updates: dict[str, str]) -> None:
     ]
     headers.extend(encoded.items())
     scope["headers"] = headers
+
+
+def _request_query_values(request_context: AuthorizationRequest, key: str) -> list[str]:
+    value = request_context.query_params.get(key)
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str) and item]
+    return []
+
+
+def _request_query_value(request_context: AuthorizationRequest, key: str) -> str | None:
+    values = _request_query_values(request_context, key)
+    return values[0] if values else None
+
+
+def _backfill_readable_mcp_results(
+    *,
+    can_read: Callable[[str], bool],
+    readable: list[dict[str, object]],
+    max_results: int,
+    next_token: str | None,
+    fetch_page: Callable[[str | None], Any],
+    get_name: Callable[[Any], str],
+    to_dict: Callable[[Any], dict[str, object]],
+) -> str | None:
+    while len(readable) < max_results and next_token:
+        start_offset = SearchUtils.parse_start_offset_from_page_token(next_token)
+        page = fetch_page(next_token)
+        if not page:
+            return None
+        consumed = 0
+        for item in page:
+            if len(readable) >= max_results:
+                break
+            consumed += 1
+            if can_read(get_name(item)):
+                readable.append(to_dict(item))
+        if consumed < len(page):
+            next_token = SearchUtils.create_page_token(start_offset + consumed)
+        else:
+            next_token = page.token
+        if isinstance(next_token, bytes):
+            next_token = next_token.decode("utf-8")
+    return next_token
+
+
+def _mcp_search_response_dict(response_class_name: str, item: Any) -> dict[str, object]:
+    mcp_server_api = importlib.import_module("mlflow.server.mcp_server_api")
+    response_class = getattr(mcp_server_api, response_class_name)
+    return response_class.from_entity(item).model_dump(mode="json")
+
+
+def _mcp_server_read_predicate(
+    authorizer: KubernetesAuthorizer,
+    identity: _RequestIdentity,
+    workspace_name: str,
+) -> Callable[[str], bool]:
+    return lambda resource_name: authorizer.is_allowed(
+        identity,
+        RESOURCE_MCP_SERVERS,
+        "get",
+        workspace_name,
+        resource_name=resource_name,
+    )
+
+
+def _mcp_search_store() -> Any:
+    return cast(Any, mlflow_handlers._get_tracking_store())
+
+
+def _filter_search_mcp_servers(
+    payload: dict[str, object],
+    *,
+    request_context: AuthorizationRequest,
+    authorizer: KubernetesAuthorizer,
+    identity: _RequestIdentity,
+    workspace_name: str,
+) -> dict[str, object]:
+    data = dict(payload)
+    mcp_servers = data.get("mcp_servers")
+    if not isinstance(mcp_servers, list):
+        return data
+
+    can_read = _mcp_server_read_predicate(authorizer, identity, workspace_name)
+    # Filter out unreadable servers from the already returned page.
+    readable: list[dict[str, object]] = []
+    for server in mcp_servers:
+        if not isinstance(server, dict):
+            continue
+        server_name = server.get("name")
+        if isinstance(server_name, str) and can_read(server_name):
+            readable.append(cast(dict[str, object], server))
+
+    max_results = int(_request_query_value(request_context, "max_results") or "100")
+    filter_string = _request_query_value(request_context, "filter_string")
+    order_by = _request_query_values(request_context, "order_by") or None
+
+    # Re-fetch to fill max results after response filtering.
+    data["next_page_token"] = _backfill_readable_mcp_results(
+        can_read=can_read,
+        readable=readable,
+        max_results=max_results,
+        next_token=_normalize_page_token(data.get("next_page_token")),
+        fetch_page=lambda token: _mcp_search_store().search_mcp_servers(
+            filter_string=filter_string,
+            max_results=max_results,
+            order_by=order_by,
+            page_token=token,
+        ),
+        get_name=lambda server: server.name,
+        to_dict=lambda server: _mcp_search_response_dict("MCPServerResponse", server),
+    )
+    data["mcp_servers"] = readable[:max_results]
+    return data
+
+
+def _filter_search_mcp_endpoints(
+    payload: dict[str, object],
+    *,
+    request_context: AuthorizationRequest,
+    authorizer: KubernetesAuthorizer,
+    identity: _RequestIdentity,
+    workspace_name: str,
+) -> dict[str, object]:
+    data = dict(payload)
+    endpoints = data.get("mcp_access_endpoints")
+    if not isinstance(endpoints, list):
+        return data
+
+    can_read = _mcp_server_read_predicate(authorizer, identity, workspace_name)
+    # Filter out unreadable endpoints from the already returned page.
+    readable: list[dict[str, object]] = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        server_name = endpoint.get("server_name")
+        if isinstance(server_name, str) and can_read(server_name):
+            readable.append(cast(dict[str, object], endpoint))
+
+    max_results = int(_request_query_value(request_context, "max_results") or "100")
+    filter_string = _request_query_value(request_context, "filter_string")
+    order_by = _request_query_values(request_context, "order_by") or None
+    server_version = _request_query_value(request_context, "server_version")
+    server_alias = _request_query_value(request_context, "server_alias")
+
+    # Re-fetch to fill max results after response filtering.
+    data["next_page_token"] = _backfill_readable_mcp_results(
+        can_read=can_read,
+        readable=readable,
+        max_results=max_results,
+        next_token=_normalize_page_token(data.get("next_page_token")),
+        fetch_page=lambda token: _mcp_search_store().search_mcp_access_endpoints(
+            filter_string=filter_string,
+            max_results=max_results,
+            order_by=order_by,
+            page_token=token,
+            server_version=server_version,
+            server_alias=server_alias,
+        ),
+        get_name=lambda endpoint: endpoint.server_name,
+        to_dict=lambda endpoint: _mcp_search_response_dict("MCPAccessEndpointResponse", endpoint),
+    )
+    data["mcp_access_endpoints"] = readable[:max_results]
+    return data
+
+
+def _backfill_mcp_search_response(
+    payload: dict[str, object],
+    *,
+    request_context: AuthorizationRequest,
+    authorizer: KubernetesAuthorizer,
+    identity: _RequestIdentity,
+    workspace_name: str,
+) -> dict[str, object]:
+    path = request_context.path
+    if path in (
+        "/ajax-api/3.0/mlflow/mcp-servers",
+        "/api/3.0/mlflow/mcp-servers",
+    ):
+        return _filter_search_mcp_servers(
+            payload,
+            request_context=request_context,
+            authorizer=authorizer,
+            identity=identity,
+            workspace_name=workspace_name,
+        )
+    if path in (
+        "/ajax-api/3.0/mlflow/mcp-servers/endpoints",
+        "/api/3.0/mlflow/mcp-servers/endpoints",
+    ):
+        return _filter_search_mcp_endpoints(
+            payload,
+            request_context=request_context,
+            authorizer=authorizer,
+            identity=identity,
+            workspace_name=workspace_name,
+        )
+    return payload
+
+
+def _normalize_page_token(token: object) -> str | None:
+    if isinstance(token, bytes):
+        return token.decode("utf-8")
+    if isinstance(token, str) and token:
+        return token
+    return None
 
 
 class KubernetesAuthMiddleware(BaseHTTPMiddleware):
@@ -230,6 +444,14 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
             identity=auth_result.identity,
             workspace_name=response_workspace_name,
         )
+        if enforceable:
+            filtered_payload = _backfill_mcp_search_response(
+                filtered_payload,
+                request_context=auth_result.request_context,
+                authorizer=self.authorizer,
+                identity=auth_result.identity,
+                workspace_name=response_workspace_name,
+            )
         if not enforceable:
             self._replace_json_response_payload(response, {})
         elif filtered_payload != payload:
@@ -342,8 +564,9 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
                     workspace_context.set_server_request_workspace(resolved_workspace_name)
                     workspace_set = True
 
-            path_params = _extract_path_params(canonical_path, request.method) or dict(
-                request.path_params
+            path_params = cast(
+                dict[str, object],
+                _extract_path_params(canonical_path, request.method) or dict(request.path_params),
             )
 
             async def _ensure_auth_request_json_body():
@@ -420,7 +643,7 @@ def create_app(app: Flask | None = None):
     config_values = KubernetesAuthConfig.from_env()
     authorizer = KubernetesAuthorizer(config_values=config_values)
     atexit.register(authorizer.close)
-    mlflow_handlers._get_graphql_auth_middleware = _registered_graphql_auth_middleware
+    mlflow_handlers._get_graphql_auth_middleware = cast(Any, _registered_graphql_auth_middleware)
 
     _compile_authorization_rules()
     fastapi_app = create_fastapi_app(app)

@@ -3,6 +3,7 @@
 These tests ensure OTEL and job APIs enforce workspace-aware authentication.
 """
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 from mlflow.utils import workspace_context
+from mlflow.utils.search_utils import SearchUtils
 from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
 from mlflow_kubernetes_plugins.auth._compat import HAS_MCP_REGISTRY
 from mlflow_kubernetes_plugins.auth.authorizer import (
@@ -36,8 +38,9 @@ from mlflow_kubernetes_plugins.auth.constants import (
     DEFAULT_REMOTE_USER_HEADER,
     RESOURCE_MCP_SERVERS,
 )
-from mlflow_kubernetes_plugins.auth.core import _AUTHORIZATION_HANDLED
+from mlflow_kubernetes_plugins.auth.core import _AUTHORIZATION_HANDLED, _RequestIdentity
 from mlflow_kubernetes_plugins.auth.middleware import KubernetesAuthMiddleware
+from mlflow_kubernetes_plugins.auth.request_context import AuthorizationRequest
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_EXISTING_MCP_SERVER_NAME,
     RESOURCE_NAME_PARSER_MCP_SERVER_NAME,
@@ -64,6 +67,7 @@ def test_otel_endpoints_in_auth_rules():
 
     # Verify they have the correct authorization rule
     rule = PATH_AUTHORIZATION_RULES[(OTLP_TRACES_PATH, "POST")]
+    assert isinstance(rule, AuthorizationRule)
     assert (rule.verb, rule.resource) == ("update", "experiments")
 
 
@@ -75,6 +79,7 @@ def test_trace_get_endpoints_in_auth_rules():
 
     for path in paths:
         rule = PATH_AUTHORIZATION_RULES[(path, "GET")]
+        assert isinstance(rule, AuthorizationRule)
         assert (rule.verb, rule.resource) == ("get", "experiments")
 
 
@@ -88,6 +93,7 @@ def test_job_api_endpoints_in_auth_rules():
 
     for path, method, verb in cases:
         rule = PATH_AUTHORIZATION_RULES[(path, method)]
+        assert isinstance(rule, AuthorizationRule)
         assert (rule.verb, rule.resource) == (verb, "experiments")
 
 
@@ -169,6 +175,148 @@ def test_mcp_registry_endpoints_in_auth_rules():
         assert rule.resource_name_parsers == expected_parsers
         assert rule.collection_policy == expected_policy
         assert rule.resource_name_verb == expected_resource_name_verb
+
+
+class FakePage(list):
+    def __init__(self, items, token):
+        super().__init__(items)
+        self.token = token
+
+
+def _decoded_page_token(offset: int) -> str:
+    token = SearchUtils.create_page_token(offset)
+    return token.decode("utf-8") if isinstance(token, bytes) else token
+
+
+def _mcp_backfill_request_context(path: str, **query_params: object) -> AuthorizationRequest:
+    return AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path=path,
+        method="GET",
+        workspace="team-a",
+        query_params=dict(query_params),
+    )
+
+
+def _visible_mcp_authorizer() -> Mock:
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name")
+        in {
+            "com.test/visible-1",
+            "com.test/visible-2",
+        }
+    )
+    return authorizer
+
+
+def test_backfill_mcp_search_response_backfills_servers(monkeypatch):
+    class FakeServerResponse:
+        @staticmethod
+        def from_entity(entity):
+            return SimpleNamespace(model_dump=lambda mode="json": {"name": entity.name})
+
+    store = Mock()
+    store.search_mcp_servers.return_value = FakePage(
+        [
+            SimpleNamespace(name="com.test/hidden"),
+            SimpleNamespace(name="com.test/visible-2"),
+        ],
+        None,
+    )
+    monkeypatch.setattr(middleware_mod.mlflow_handlers, "_get_tracking_store", lambda: store)
+
+    with patch.dict(
+        sys.modules,
+        {"mlflow.server.mcp_server_api": SimpleNamespace(MCPServerResponse=FakeServerResponse)},
+    ):
+        updated = middleware_mod._backfill_mcp_search_response(
+            {
+                "mcp_servers": [{"name": "com.test/visible-1"}],
+                "next_page_token": SearchUtils.create_page_token(2),
+            },
+            request_context=_mcp_backfill_request_context(
+                "/api/3.0/mlflow/mcp-servers", max_results="2"
+            ),
+            authorizer=_visible_mcp_authorizer(),
+            identity=_RequestIdentity(token="token"),
+            workspace_name="team-a",
+        )
+
+    assert updated == {
+        "mcp_servers": [{"name": "com.test/visible-1"}, {"name": "com.test/visible-2"}],
+        "next_page_token": None,
+    }
+    store.search_mcp_servers.assert_called_once_with(
+        filter_string=None,
+        max_results=2,
+        order_by=None,
+        page_token=_decoded_page_token(2),
+    )
+
+
+def test_backfill_mcp_search_response_backfills_endpoints(monkeypatch):
+    class FakeEndpointResponse:
+        @staticmethod
+        def from_entity(entity):
+            return SimpleNamespace(
+                model_dump=lambda mode="json": {
+                    "id": entity.endpoint_id,
+                    "server_name": entity.server_name,
+                }
+            )
+
+    store = Mock()
+    store.search_mcp_access_endpoints.return_value = FakePage(
+        [
+            SimpleNamespace(endpoint_id="ep-hidden", server_name="com.test/hidden"),
+            SimpleNamespace(endpoint_id="ep-2", server_name="com.test/visible-2"),
+        ],
+        None,
+    )
+    monkeypatch.setattr(middleware_mod.mlflow_handlers, "_get_tracking_store", lambda: store)
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow.server.mcp_server_api": SimpleNamespace(
+                MCPAccessEndpointResponse=FakeEndpointResponse
+            )
+        },
+    ):
+        updated = middleware_mod._backfill_mcp_search_response(
+            {
+                "mcp_access_endpoints": [{"id": "ep-1", "server_name": "com.test/visible-1"}],
+                "next_page_token": SearchUtils.create_page_token(2),
+            },
+            request_context=_mcp_backfill_request_context(
+                "/api/3.0/mlflow/mcp-servers/endpoints",
+                max_results="2",
+                server_alias="prod",
+            ),
+            authorizer=_visible_mcp_authorizer(),
+            identity=_RequestIdentity(token="token"),
+            workspace_name="team-a",
+        )
+
+    assert updated == {
+        "mcp_access_endpoints": [
+            {"id": "ep-1", "server_name": "com.test/visible-1"},
+            {"id": "ep-2", "server_name": "com.test/visible-2"},
+        ],
+        "next_page_token": None,
+    }
+    store.search_mcp_access_endpoints.assert_called_once_with(
+        filter_string=None,
+        max_results=2,
+        order_by=None,
+        page_token=_decoded_page_token(2),
+        server_version=None,
+        server_alias="prod",
+    )
 
 
 def test_synthetic_mcp_fastapi_routes_require_exact_auth_templates():
