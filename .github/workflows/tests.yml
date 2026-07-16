@@ -89,6 +89,13 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
         # Keep quoted so YAML does not coerce 3.10 to 3.1.
         mlflow-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Pin to the commit on mlflow/mlflow's master branch as of 2026-07-16 so this
+          # remains reproducible while still exercising MCP registry coverage before MLflow 3.15.
+          # Replace this with mlflow~=3.15.0 once MCP registry ships in a stable release.
+          - python-version: "3.12"
+            mlflow-version: "master@a00b6ee"
+            mlflow-install-spec: "git+https://github.com/mlflow/mlflow.git@a00b6eef8aafed8241a22e9689472e647f640952"
         exclude:
           - python-version: "3.14"
             mlflow-version: "3.14"
@@ -100,9 +107,15 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
+        env:
+          MLFLOW_INSTALL_SPEC: ${{ matrix.mlflow-install-spec }}
         run: |
           uv venv
-          uv pip install -e ".[dev]" "mlflow~=${{ matrix.mlflow-version }}.0"
+          if [[ -n "${MLFLOW_INSTALL_SPEC}" ]]; then
+            uv pip install -e ".[dev]" "${MLFLOW_INSTALL_SPEC}"
+          else
+            uv pip install -e ".[dev]" "mlflow~=${{ matrix.mlflow-version }}.0"
+          fi
 
       - name: Lint
         run: make python-lint
