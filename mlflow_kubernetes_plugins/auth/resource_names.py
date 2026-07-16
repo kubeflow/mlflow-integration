@@ -39,6 +39,7 @@ RESOURCE_NAME_PARSER_OPTIONAL_TRACE_IDS_TO_EXPERIMENT_NAMES = (
 RESOURCE_NAME_PARSER_TRACE_V3_EXPERIMENT_ID_TO_NAME = "trace_v3_experiment_id_to_name"
 RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME = "artifact_experiment_id_to_name"
 RESOURCE_NAME_PARSER_OTEL_EXPERIMENT_ID_HEADER_TO_NAME = "otel_experiment_id_header_to_name"
+RESOURCE_NAME_PARSER_MCP_SERVER_NAME = "mcp_server_name"
 RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME = "gateway_secret_id_to_name"
 RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME = "optional_gateway_secret_id_to_name"
 RESOURCE_NAME_PARSER_GATEWAY_ENDPOINT_ID_TO_NAME = "gateway_endpoint_id_to_name"
@@ -669,6 +670,13 @@ def _parse_otel_experiment_id_header_to_name(
     return (_resolve_experiment_name_from_experiment_id(experiment_id),)
 
 
+def _parse_mcp_server_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
+    path_name = _get_single_value(request_context.path_params, "name")
+    if path_name is not None:
+        return (path_name,)
+    return (_get_request_param(request_context, "name"),)
+
+
 def _parse_gateway_secret_id_to_name(request_context: AuthorizationRequest) -> tuple[str, ...]:
     return (
         _resolve_gateway_secret_name_from_secret_id(
@@ -936,6 +944,7 @@ RESOURCE_NAME_PARSERS: dict[str, "Callable[[AuthorizationRequest], tuple[str, ..
     RESOURCE_NAME_PARSER_OTEL_EXPERIMENT_ID_HEADER_TO_NAME: (
         _parse_otel_experiment_id_header_to_name
     ),
+    RESOURCE_NAME_PARSER_MCP_SERVER_NAME: _parse_mcp_server_name,
     RESOURCE_NAME_PARSER_GATEWAY_SECRET_ID_TO_NAME: _parse_gateway_secret_id_to_name,
     RESOURCE_NAME_PARSER_OPTIONAL_GATEWAY_SECRET_ID_TO_NAME: (
         _parse_optional_gateway_secret_id_to_name
@@ -1035,6 +1044,7 @@ __all__ = [
     "RESOURCE_NAME_PARSER_GRAPHQL_RUN_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_ISSUE_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_JOB_ID_TO_EXPERIMENT_NAME",
+    "RESOURCE_NAME_PARSER_MCP_SERVER_NAME",
     "RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_EXPERIMENT_NAME",
     "RESOURCE_NAME_PARSER_NEW_REGISTERED_MODEL_NAME",

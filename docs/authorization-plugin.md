@@ -9,7 +9,7 @@ The `kubernetes-auth` plugin wraps the MLflow server with authorization checks b
 - supports trusted-proxy `SubjectAccessReview` mode using forwarded user and group headers
 - checks MLflow operations against resources in the `mlflow.kubeflow.org` API group
 - supports broad workspace access and many fine-grained `resourceNames` checks for experiments,
-  datasets, registered models, and gateway resources
+  datasets, MCP servers, registered models, and gateway resources
 - filters many collection requests and responses so partially authorized callers can still browse
   the MLflow objects they are allowed to see
 - filters workspace lists down to namespaces the caller can access
@@ -110,6 +110,8 @@ plugin uses the configured namespace instead.
 
 - workspace listings are filtered by the caller's visible namespaces
 - GraphQL and FastAPI routes are covered in addition to the classic Flask endpoints
+- MCP registry FastAPI routes are authorized through the `mcpservers` pseudo-resource, and
+  MCP server and binding collection responses are filtered to the caller's readable servers
 - GraphQL collection fields use server-side filtering, while single-object GraphQL reads keep explicit request-time authorization
 - gateway resource access uses `use` subresources for fine-grained RBAC checks
 - gateway guardrails use the dedicated `gatewayguardrails` resource but remain workspace-scoped
