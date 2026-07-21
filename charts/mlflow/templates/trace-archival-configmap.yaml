@@ -1,0 +1,33 @@
+{{- if .Values.traceArchival.enabled }}
+{{- $maxTracesPerPass := .Values.traceArchival.maxTracesPerPass }}
+{{- if not (or (kindIs "int" $maxTracesPerPass) (kindIs "int64" $maxTracesPerPass) (and (kindIs "float64" $maxTracesPerPass) (eq $maxTracesPerPass (floor $maxTracesPerPass)))) }}
+{{- fail "traceArchival.maxTracesPerPass must be a positive integer" }}
+{{- else if le (int64 $maxTracesPerPass) 0 }}
+{{- fail "traceArchival.maxTracesPerPass must be a positive integer" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mlflow.traceArchival.configMapName" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trace-archival
+data:
+  trace-archival.yaml: |
+    trace_archival:
+      enabled: true
+      {{- if .Values.traceArchival.location }}
+      location: {{ .Values.traceArchival.location | quote }}
+      {{- end }}
+      {{- if .Values.traceArchival.retention }}
+      retention: {{ .Values.traceArchival.retention | quote }}
+      {{- end }}
+      max_traces_per_pass: {{ $maxTracesPerPass }}
+      {{- if .Values.traceArchival.longRetentionAllowlist }}
+      long_retention_allowlist:
+        {{- range .Values.traceArchival.longRetentionAllowlist }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,266 @@
+name: Helm Chart CI
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/**"
+      - ".github/workflows/helm-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helm-lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - profile: standalone
+            namespace: default
+          - profile: multi-user
+            namespace: kubeflow
+          - profile: workloads-enabled
+            namespace: mlflow-system
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+
+      - name: Lint chart (${{ matrix.profile }})
+        run: |
+          helm lint charts/mlflow \
+            --namespace "${{ matrix.namespace }}" \
+            -f charts/mlflow/ci/values-${{ matrix.profile }}.yaml
+
+  helm-template:
+    runs-on: ubuntu-latest
+    needs: helm-lint
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+
+      - name: Template standalone profile
+        run: |
+          helm template mlflow charts/mlflow \
+            -f charts/mlflow/ci/values-standalone.yaml \
+            > /tmp/standalone.yaml
+          echo "=== Standalone resource kinds ==="
+          grep '^kind:' /tmp/standalone.yaml | sort | uniq -c
+
+      - name: Template multi-user profile
+        run: |
+          helm template mlflow charts/mlflow \
+            --namespace kubeflow \
+            -f charts/mlflow/ci/values-multi-user.yaml \
+            > /tmp/multi-user.yaml
+          echo "=== Multi-user resource kinds ==="
+          grep '^kind:' /tmp/multi-user.yaml | sort | uniq -c
+
+      - name: Template workloads-enabled profile
+        run: |
+          helm template mlflow charts/mlflow \
+            --namespace mlflow-system \
+            -f charts/mlflow/ci/values-workloads-enabled.yaml \
+            > /tmp/workloads-enabled.yaml
+          echo "=== Workloads-enabled resource kinds ==="
+          grep '^kind:' /tmp/workloads-enabled.yaml | sort | uniq -c
+
+      - name: Template edge-case profiles
+        run: |
+          helm template mlflow charts/mlflow \
+            --namespace kubeflow \
+            -f charts/mlflow/ci/values-multi-user.yaml \
+            --set-string mlflow.staticPrefix=/mlflow/ \
+            > /tmp/trailing-prefix.yaml
+
+          long_release=$(printf 'a%.0s' {1..53})
+          helm template "$long_release" charts/mlflow \
+            --namespace mlflow-system \
+            -f charts/mlflow/ci/values-workloads-enabled.yaml \
+            > /tmp/long-names.yaml
+
+      - name: Verify standalone has no Istio resources
+        run: |
+          if grep -q 'kind: VirtualService\|kind: AuthorizationPolicy\|kind: DestinationRule' /tmp/standalone.yaml; then
+            echo "ERROR: Standalone profile should not contain Istio resources"
+            exit 1
+          fi
+          echo "OK: No Istio resources in standalone profile"
+
+      - name: Verify multi-user profile has Istio resources
+        run: |
+          for kind in VirtualService AuthorizationPolicy DestinationRule; do
+            if ! grep -q "kind: $kind" /tmp/multi-user.yaml; then
+              echo "ERROR: Multi-user profile is missing $kind"
+              exit 1
+            fi
+          done
+          echo "OK: All Istio resources present in multi-user profile"
+
+      - name: Verify multi-user profile has NetworkPolicy
+        run: |
+          if ! grep -q 'kind: NetworkPolicy' /tmp/multi-user.yaml; then
+            echo "ERROR: Multi-user profile is missing NetworkPolicy"
+            exit 1
+          fi
+          echo "OK: NetworkPolicy present in multi-user profile"
+
+      - name: Verify standalone has no NetworkPolicy
+        run: |
+          if grep -q 'kind: NetworkPolicy' /tmp/standalone.yaml; then
+            echo "ERROR: Standalone profile should not contain NetworkPolicy"
+            exit 1
+          fi
+          echo "OK: No NetworkPolicy in standalone profile"
+
+      - name: Verify enabled optional workloads
+        run: |
+          for kind in Job CronJob ServiceMonitor; do
+            if ! grep -q "kind: $kind" /tmp/workloads-enabled.yaml; then
+              echo "ERROR: Workloads-enabled profile is missing $kind"
+              exit 1
+            fi
+          done
+
+          for name in CI_ROOT_ENV CI_ROOT_ENV_FROM; do
+            count=$(grep -c "name: $name$" /tmp/workloads-enabled.yaml)
+            if [ "$count" -ne 4 ]; then
+              echo "ERROR: Expected $name in all four MLflow workloads, found $count"
+              exit 1
+            fi
+          done
+
+          if grep -q 'insecureSkipVerify: true' /tmp/workloads-enabled.yaml; then
+            echo "ERROR: ServiceMonitor must not disable TLS verification by default"
+            exit 1
+          fi
+
+          if grep -q 'optional: true' /tmp/workloads-enabled.yaml; then
+            echo "ERROR: Configured CA ConfigMaps must be required"
+            exit 1
+          fi
+
+          if [ "$(grep -c 'name: MLFLOW_MYSQL_SSL_CA$' /tmp/workloads-enabled.yaml)" -ne 4 ]; then
+            echo "ERROR: Expected MLFLOW_MYSQL_SSL_CA in all four MLflow workloads"
+            exit 1
+          fi
+
+          if grep -q 'name: MLFLOW_MYSQL_CA$' /tmp/workloads-enabled.yaml; then
+            echo "ERROR: Found unsupported MLFLOW_MYSQL_CA"
+            exit 1
+          fi
+
+          if ! grep -q '"helm.sh/hook-delete-policy": before-hook-creation$' /tmp/workloads-enabled.yaml; then
+            echo "ERROR: Migration ConfigMap must remain available to the migration Job"
+            exit 1
+          fi
+
+          for host in localhost '10.*' mlflow.mlflow-system.svc.cluster.local mlflow.example.com; do
+            if ! grep -Fq "$host" /tmp/workloads-enabled.yaml; then
+              echo "ERROR: Allowed hosts are missing $host"
+              exit 1
+            fi
+          done
+
+          echo "OK: Enabled optional features rendered securely"
+
+      - name: Verify route normalization and component name limits
+        run: |
+          if ! grep -q 'prefix: /mlflow/$' /tmp/trailing-prefix.yaml \
+            || ! grep -q 'exact: /mlflow$' /tmp/trailing-prefix.yaml \
+            || grep -q '/mlflow//' /tmp/trailing-prefix.yaml; then
+            echo "ERROR: Trailing static prefix was not normalized"
+            exit 1
+          fi
+
+          cronjob_names=$(awk '/^  name: .*-(gc|trace-archival)$/ { sub(/^  name: /, ""); print }' /tmp/long-names.yaml)
+          if [ -z "$cronjob_names" ]; then
+            echo "ERROR: Long-name render is missing CronJob component names"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            if [ "${#name}" -gt 52 ]; then
+              echo "ERROR: CronJob component name exceeds 52 characters: $name"
+              exit 1
+            fi
+          done <<< "$cronjob_names"
+
+          migration_names=$(awk '/^  name: .*db-migrate$/ { sub(/^  name: /, ""); print }' /tmp/long-names.yaml)
+          if [ -z "$migration_names" ]; then
+            echo "ERROR: Long-name render is missing migration component names"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            if [ "${#name}" -gt 63 ]; then
+              echo "ERROR: Migration component name exceeds 63 characters: $name"
+              exit 1
+            fi
+          done <<< "$migration_names"
+
+          echo "OK: Routes and component names are valid"
+
+  kind-smoke-test:
+    runs-on: ubuntu-latest
+    needs: helm-template
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Helm
+        uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+
+      - name: Create kind cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          version: v0.29.0
+          cluster_name: mlflow-chart
+
+      - name: Install MLflow chart
+        run: |
+          helm upgrade --install mlflow charts/mlflow \
+            --namespace mlflow \
+            --create-namespace \
+            --wait \
+            --timeout 5m \
+            -f charts/mlflow/ci/values-standalone.yaml
+          kubectl rollout status deployment/mlflow \
+            --namespace mlflow \
+            --timeout 2m
+
+      - name: Verify MLflow health endpoint
+        run: |
+          kubectl port-forward --namespace mlflow service/mlflow 15000:5000 \
+            > /tmp/mlflow-port-forward.log 2>&1 &
+          port_forward_pid=$!
+          trap 'kill "$port_forward_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:15000/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat /tmp/mlflow-port-forward.log
+          exit 1
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          kubectl get all,pvc --namespace mlflow -o wide || true
+          kubectl describe pods --namespace mlflow || true
+          kubectl logs --namespace mlflow deployment/mlflow --all-containers || true

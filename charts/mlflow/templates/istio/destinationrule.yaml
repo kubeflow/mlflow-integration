@@ -1,0 +1,15 @@
+{{- if and .Values.istio.enabled .Values.istio.destinationRule.enabled }}
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: {{ include "mlflow.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+spec:
+  host: {{ include "mlflow.service.fullhost" . }}
+  {{- with .Values.istio.destinationRule.trafficPolicy }}
+  trafficPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

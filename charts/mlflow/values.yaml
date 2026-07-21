@@ -1,0 +1,247 @@
+# Default values for the MLflow Helm chart.
+# Standalone-friendly defaults — TLS, NetworkPolicy, and metrics are off.
+
+# Override the chart name used in resource names.
+nameOverride: ""
+# Override the complete resource name. The value is truncated to Kubernetes limits.
+fullnameOverride: ""
+
+# Labels added to every chart resource.
+commonLabels: {}
+# Labels and annotations added only to the MLflow server pod.
+podLabels: {}
+podAnnotations: {}
+
+# Number of MLflow server pods. When local ReadWriteOnce storage is enabled, the
+# Deployment uses the Recreate strategy; use remote stores before scaling out.
+replicaCount: 1
+
+# MLflow image containing the Kubernetes workspace and authorization plugins.
+image:
+  repository: ghcr.io/kubeflow/mlflow-integration
+  tag: "latest"
+  # Valid values: Always, IfNotPresent, Never.
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  # Required for Kubernetes workspace discovery and authorization reviews.
+  automountServiceAccountToken: true
+
+# Resource requests and limits for the MLflow server container. No defaults are
+# imposed so the chart works with cluster LimitRanges and varied workload sizes.
+# Example:
+# resources:
+#   requests:
+#     cpu: 500m
+#     memory: 1Gi
+#   limits:
+#     cpu: "2"
+#     memory: 2Gi
+resources: {}
+
+# Pod-level security settings shared by the server and maintenance workloads.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# TLS terminated directly by uvicorn. Leave disabled for plain HTTP.
+tls:
+  enabled: false
+  # Existing kubernetes.io/tls Secret containing tls.crt and tls.key.
+  secretName: mlflow-tls
+  # Decimal file mode for the mounted Secret; 420 is octal 0644.
+  defaultMode: 420
+
+# MLflow server configuration.
+mlflow:
+  # Metadata store URI. Either this value or backendStoreUriFrom is required.
+  # For local development: sqlite:////mlflow/mlflow.db
+  # For production: postgresql://user:password@postgresql:5432/mlflow
+  backendStoreUri: ""
+  # ValueFrom source for MLFLOW_BACKEND_STORE_URI; use this for credentials.
+  # Example:
+  # backendStoreUriFrom:
+  #   secretKeyRef:
+  #     name: mlflow-database
+  #     key: backend-store-uri
+  backendStoreUriFrom: {}
+  # Optional separate model registry store. It defaults to the backend store.
+  # registryStoreUri: ""
+  # Accepts the same secretKeyRef structure as backendStoreUriFrom.
+  # registryStoreUriFrom: {}
+  # Artifact destination used when serveArtifacts is true. file:// destinations
+  # require storage.enabled; use s3://, gs://, or another remote URI in production.
+  artifactsDestination: "file:///mlflow/artifacts"
+  # Optional artifact root for runs whose experiments do not define one.
+  # defaultArtifactRoot: ""
+  # Workspace provider URI. kubernetes:// maps workspaces to namespaces.
+  workspaceStoreUri: "kubernetes://"
+  # Optional namespace label selector, for example mlflow-enabled=true.
+  # workspaceLabelSelector: "mlflow-enabled=true"
+  # Proxy artifact reads and writes through the MLflow server.
+  serveArtifacts: true
+  # Gunicorn worker processes per pod. This is independent of replicaCount.
+  workers: 1
+  # Container port on which MLflow listens.
+  port: 5000
+  # Additional allowed Host header patterns, such as external ingress hostnames.
+  # MLflow's safe defaults and this release's Service DNS names are included automatically.
+  allowedHosts: []
+  # Comma-separated browser origins, for example https://mlflow.example.com.
+  corsAllowedOrigins: ""
+  # URL prefix for proxied deployments, for example /mlflow. Leave empty for root.
+  staticPrefix: ""
+  # Authorization modes:
+  # - self_subject_access_review: use each caller's bearer token (default).
+  # - subject_access_review: trust user/group headers from an authenticating proxy;
+  #   the server ServiceAccount submits SubjectAccessReviews for those identities.
+  authorizationMode: self_subject_access_review
+
+# Additional environment variables added to the server and all maintenance
+# workloads. Entries are rendered after chart-managed variables and can override them.
+env: []
+# Import environment variables from Secrets or ConfigMaps.
+# Example: [{secretRef: {name: mlflow-runtime}}]
+envFrom: []
+
+# Persistent storage for SQLite and file-based artifacts.
+storage:
+  enabled: true
+  size: 2Gi
+  # Empty selects the cluster's default StorageClass.
+  storageClassName: ""
+  # Common values are ReadWriteOnce and ReadWriteMany.
+  accessMode: ReadWriteOnce
+
+# Service exposing the MLflow server inside the cluster.
+service:
+  # Common values: ClusterIP, NodePort, LoadBalancer.
+  type: ClusterIP
+  port: 5000
+  annotations: {}
+
+# Prometheus metrics and ServiceMonitor. Requires the ServiceMonitor CRD.
+metrics:
+  enabled: false
+  # Prometheus Operator TLSConfig used when tls.enabled is true.
+  tlsConfig: {}
+
+# Istio resources for Kubeflow multi-user routing. Requires the Istio CRDs.
+istio:
+  enabled: false
+  virtualService:
+    enabled: false
+    annotations: {}
+    gateways:
+      - kubeflow-gateway
+    hosts:
+      - "*"
+    # Complete custom VirtualService HTTP routes. When empty, the chart generates
+    # routes for mlflow.staticPrefix.
+    http: []
+  authorizationPolicy:
+    enabled: false
+    # Valid Istio actions include ALLOW, DENY, AUDIT, and CUSTOM.
+    action: ALLOW
+    rules:
+      - from:
+          - source:
+              principals:
+                - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+  destinationRule:
+    enabled: false
+    trafficPolicy:
+      tls:
+        mode: ISTIO_MUTUAL
+
+# NetworkPolicy for MLflow pods. Disabled for maximum standalone compatibility.
+networkPolicy:
+  enabled: false
+  # Replaces the chart's default egress rules when non-empty.
+  egressRules: []
+  # Appended to either the default or user-supplied egress rules.
+  additionalEgressRules: []
+
+# Node placement settings shared by the Deployment, Jobs, and CronJobs.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod-level Dynamic Resource Allocation claims. Containers may reference these
+# by claim name from their own resources.claims configuration.
+resourceClaims: []
+
+# Database migration Job (Helm pre-install/pre-upgrade hook).
+# Runs schema migrations before the server starts. Recommended for
+# production deployments with PostgreSQL or MySQL. Not needed for SQLite.
+migrations:
+  enabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Garbage collection CronJob. Permanently removes soft-deleted MLflow resources.
+garbageCollection:
+  enabled: false
+  # Cron expression; the default runs weekly at 02:00 on Sunday.
+  schedule: "0 2 * * 0"
+  # Optional minimum age, for example 30d or 7d12h.
+  # olderThan: "30d"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# Trace archival CronJob. Moves old trace payloads out of the SQL store.
+traceArchival:
+  enabled: false
+  # Cron expression; the default runs every six hours.
+  schedule: "0 */6 * * *"
+  # Both location and retention are required when enabled.
+  # location: "s3://mlflow-trace-archive"
+  # retention: "30d"
+  # Maximum number of traces archived by one scheduler pass; must be positive.
+  maxTracesPerPass: 1000
+  # Trace names that use MLflow's long-retention policy.
+  longRetentionAllowlist: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# CA bundle for custom TLS trust chains. ConfigMaps activate the bundle
+# machinery; filePaths add existing files from the image to that combined bundle.
+caBundle:
+  # Existing certificate files in the image, processed in order.
+  # Example: [/etc/ssl/certs/ca-certificates.crt]
+  filePaths: []
+  # ConfigMaps containing .crt or .pem files.
+  # Example:
+  # configMaps:
+  #   - name: platform-trusted-ca-bundle
+  #     mountPath: /etc/pki/custom-ca
+  configMaps: []
+  # Generated PEM bundle path mounted into all MLflow workloads.
+  outputPath: /etc/pki/tls/certs/combined/ca-bundle.crt
+  # Seconds between source checks by the server sidecar.
+  watchInterval: 30

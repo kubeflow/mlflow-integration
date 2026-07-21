@@ -1,0 +1,17 @@
+{{- if .Values.migrations.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mlflow.migration.fullname" . }}
+  namespace: {{ include "mlflow.namespace" . }}
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-migration
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "-10"
+data:
+  db_migrate.py: |
+{{ .Files.Get "scripts/db_migrate.py" | indent 4 }}
+{{- end }}

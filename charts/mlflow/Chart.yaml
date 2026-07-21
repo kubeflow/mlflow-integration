@@ -1,0 +1,18 @@
+apiVersion: v2
+name: mlflow
+description: MLflow experiment tracking with Kubernetes-native workspaces and RBAC
+type: application
+version: 0.1.0
+appVersion: "3.13.0"
+keywords:
+  - mlflow
+  - experiment-tracking
+  - machine-learning
+  - kubeflow
+home: https://github.com/kubeflow/mlflow-integration
+sources:
+  - https://github.com/kubeflow/mlflow-integration
+  - https://github.com/mlflow/mlflow
+maintainers:
+  - name: Kubeflow MLflow Integration Maintainers
+    url: https://github.com/kubeflow/mlflow-integration
