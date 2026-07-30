@@ -6,7 +6,7 @@ For general Kubeflow contribution guidelines, please check the
 
 ## Requirements
 
-- [Supported Python version](./pyproject.toml#L10)
+- [Supported Python version](./pyproject.toml)
 - [uv](https://docs.astral.sh/uv/)
 
 ## Development
@@ -61,6 +61,17 @@ make generate-k8s
 make verify-generated
 ```
 
+### Helm Chart Verification
+
+If you modify the chart under `charts/mlflow/`, lint every supported CI profile:
+
+```bash
+helm lint charts/mlflow -f charts/mlflow/ci/values-standalone.yaml
+helm lint charts/mlflow -f charts/mlflow/ci/values-multi-user.yaml
+helm lint charts/mlflow -f charts/mlflow/ci/values-workloads-enabled.yaml
+helm package charts/mlflow --destination /tmp
+```
+
 ### Building
 
 To build the Python package:
@@ -68,6 +79,14 @@ To build the Python package:
 ```bash
 uv build
 ```
+
+### Publishing Releases
+
+Pushing a `vX.Y.Z` tag publishes the Python package, container image, and Helm
+chart through the repository's GitHub Actions workflows. The chart is published
+to `oci://ghcr.io/kubeflow/charts/mlflow` at version `X.Y.Z`, while the matching
+container image uses the `vX.Y.Z` tag. To recover a failed chart publication,
+dispatch **Publish Helm Chart** with the existing release tag.
 
 ## Best Practices
 
