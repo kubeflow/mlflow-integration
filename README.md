@@ -38,6 +38,9 @@ For local development:
 uv sync --extra dev
 ```
 
+For Kubernetes deployment, see the
+[`charts/mlflow` installation guide](charts/mlflow/README.md).
+
 ## Quick Start
 
 1. Enable MLflow workspaces on an MLflow server backed by a SQL store.
