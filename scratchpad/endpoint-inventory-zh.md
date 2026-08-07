@@ -33,10 +33,10 @@
 | Experiment | **SearchPromptOptimizationJobs** | request_filter_experiment_id | 用户传单个 experiment_id → SSAR 检查 → 有权放行 / 无权 403 | 过滤机制不变；单个 ID 无批量收益 |
 | Experiment | **SearchIssues** (v3.11) | request_filter_experiment_id | 同上 | 同上 |
 | Experiment | **SearchTraces** | response_filter_traces | 放行 → 后置逐个 SSAR 检查 experiment → 过滤 | **路径 A** — 可改造 experiment_ids 数组（API 有该参数） |
-| Experiment | **BatchGetTraces** | response_filter_traces | 放行 → 后置逐个 SSAR 检查 → 过滤 | **路径 C** — 只有 `trace_ids`，无 experiment 参数、无分页、无 filter_string → 保持后置过滤，用 1 次 SSRR 批量获取允许的 experiment name set 替代逐个 SSAR |
-| Experiment | **BatchGetTraceInfos** (v3.11) | response_filter_traces | 同上 | **路径 C** — 同上 |
+| Experiment | **BatchGetTraces** | response_filter_traces | 放行 → 后置逐个 SSAR 检查 → 过滤 | 当前无 `experiment_ids` 参数；`trace_info` 内部有 `experiment_id` → 上游新增可选 `experiment_ids` 参数 → **路径 A** |
+| Experiment | **BatchGetTraceInfos** (v3.11) | response_filter_traces | 同上 | 同上 → **路径 A** |
 | Experiment | **SearchEvaluationDatasets** | response_filter_dataset_summaries | 放行 → 后置逐个 SSAR 检查 experiment → 过滤 | **路径 A** — 可改造 experiment_ids 数组（API 有该参数） |
-| Experiment | **ListScorers** (v3.13 hybrid) | response_filter_scorers (hybrid) | **有 experiment_id 时**：SSAR 检查该实验权限 → 有权放行 / 无权 403。**无 experiment_id 时**：放行 → 后置逐个 SSAR 过滤 | **路径 C** — API 无分页（无 page_token），保持后置过滤，用 1 次 SSRR 批量获取允许的 experiment name set 替代逐个 SSAR |
+| Experiment | **ListScorers** (v3.13 hybrid) | response_filter_scorers (hybrid) | **有 experiment_id 时**：SSAR 检查该实验权限 → 有权放行 / 无权 403。**无 experiment_id 时**：放行 → 后置逐个 SSAR 过滤 | 内部 `list_scorers_across_experiments(experiment_ids)` 已接受 ID 列表；上游暴露可选 `experiment_ids` 参数 → **路径 A** |
 
 ### RegisteredModel（顶级资源）
 
@@ -117,16 +117,32 @@ for item in items:                      allowed = SSRR("experiments", "get", ws)
 
 ## 改造路径分类
 
-SSRR 是授权后端的横切优化；下面的路径分类针对的是**过滤机制**层面的改造。所有"要改"的端点按可行方案分为四条路径：
+SSRR 是授权后端的横切优化；下面的路径分类针对的是**过滤机制**层面的改造。
+
+### 为什么不同端点用不同的注入方式
+
+`experiment_ids` 和 `name IN (...)` 的选择是务实的，不是按类别划分的。每个端点用的是**改动量最小**的参数：
+
+- SearchTraces、SearchEvaluationDatasets → API 已有 `experiment_ids` → 直接注入
+- BatchGetTraces、ListScorers → 当前无对应参数，但底层 store 支持 `experiment_id` 过滤 → 上游新增可选 `experiment_ids`（经 PE review 反馈确认）
+- model-versions/search → 是 RegisteredModel 的子资源，但其 `filter_string` 已支持 `name`，只缺 `IN` → 扩展 `filter_string` 而非新增参数
+- SearchExperiments、SearchRegisteredModels → `filter_string` 已有 `name` 作为合法 key，只缺 `IN` 运算符 → 扩展 `filter_string`
+
+因此资源层级（子资源 vs 顶级）与注入方式（`experiment_ids` vs `filter_string`）之间的对应关系并不整齐 — 但强行统一只会增加不必要的上游改动量。
+
+所有需改造的端点归入两条路径：
 
 ### 路径 A：SSRR → 注入 scoping 数组参数（前置改写）
 
-API 已有可缩小的数组参数（如 `experiment_ids`）。SSRR 拿到允许的 resource name → 转 ID → 注入数组 → MLflow 只查授权范围内的数据。**分页 cursor 正确**，是最理想的方案。
+SSRR 拿到允许的 resource name → 转 ID → 注入 `experiment_ids` 数组 → MLflow 只查授权范围内的数据。**分页 cursor 正确**，是最理想的方案。
 
-| 端点 | 注入的参数 |
-|---|---|
-| SearchTraces | `experiment_ids` |
-| SearchEvaluationDatasets | `experiment_ids` |
+| 端点 | 注入的参数 | 需要上游改动？ |
+|---|---|---|
+| SearchTraces | `experiment_ids` | 否 — 参数已存在 |
+| SearchEvaluationDatasets | `experiment_ids` | 否 — 参数已存在 |
+| BatchGetTraces | `experiment_ids` | 是 — 新增可选参数；`trace_info` 内部已有 `experiment_id`，store 层加小量 `IN` 过滤 |
+| BatchGetTraceInfos (v3.11) | `experiment_ids` | 是 — 同 BatchGetTraces |
+| ListScorers (v3.13 hybrid) | `experiment_ids` | 是 — 内部 `list_scorers_across_experiments(experiment_ids)` 已存在；暴露为可选 API 参数 |
 
 ### 路径 B：SSRR → 注入 filter_string（前置改写，需上游 PR）
 
@@ -143,28 +159,7 @@ API 有 `filter_string`，但当前 MLflow **不支持** `name IN (...)`。需�
 | MCP servers list (v3.14) | `name IN (...)` | `SearchMCPServerUtils.validate_list_supported` 加 `name` | ✅ 已确认可行 |
 | MCP access endpoints (v3.14) | `server_name IN (...)` | `SearchMCPAccessEndpointUtils` 加 override `validate_list_supported` | ✅ 已确认可行 |
 
-### 路径 C：保持后置过滤 + SSRR 批量优化（无分页端点）
-
-API **无分页**（无 `page_token`/`max_results`），pagination cursor 错乱问题不存在，后置过滤本身是正确的。优化点：用 **1 次 SSRR** 批量获取允许的 resource name set，替代当前的**逐个 SSAR** 检查（N 次 K8s API 调用 → 1 次）。
-
-```
-当前：                                 路径 C 优化后：
-
-for item in response:                  allowed = SSRR("experiments", "get", ws)
-  name = resolve(item.exp_id)          → {"exp-a", "exp-c", ...}    ← 1 次 K8s 调用
-  SSAR(name)  ← 每个 1 次 K8s 调用
-                                       for item in response:
-                                         name = resolve(item.exp_id)
-                                         name in allowed  ← set lookup, 0 次 K8s 调用
-```
-
-| 端点 | 说明 |
-|---|---|
-| BatchGetTraces | 只有 `trace_ids`，无 experiment 参数、无分页 |
-| BatchGetTraceInfos (v3.11) | 同上 |
-| ListScorers (v3.13 hybrid) | 只有单个可选 `experiment_id`，无分页。有 ID 时已按 resourceName 鉴权；无 ID 时走此路径 |
-
-> **注意**：路径 A/B/C 均依赖 SSRR 获取授权范围。SSRR 的适用条件和约束见上方"横切优化"章节。
+> **注意**：路径 A/B 均依赖 SSRR 获取授权范围。SSRR 的适用条件和约束见上方"横切优化"章节。
 
 ---
 
@@ -173,9 +168,8 @@ for item in response:                  allowed = SSRR("experiments", "get", ws)
 | 分类 | 端点数 | 过滤机制改造？ | SSRR 横切优化？ |
 |---|---|---|---|
 | **response_filter（本次目标）** | **11 + 1 GraphQL** | **是** | **是** |
-| 其中：路径 A（注入 scoping 数组参数） | 2（SearchTraces、SearchEvaluationDatasets） | 方案明确 | 1 次 SSRR 替代逐个 SSAR |
+| 其中：路径 A（注入 `experiment_ids`） | 5（SearchTraces、SearchEvaluationDatasets、BatchGetTraces、BatchGetTraceInfos、ListScorers） | 2 个参数已存在；3 个需上游 API 改动 | 1 次 SSRR 替代逐个 SSAR |
 | 其中：路径 B（注入 filter_string，需上游 PR） | 5 REST + 1 GraphQL | 方案明确，上游改动已调研（~20 行） | 同上 |
-| 其中：路径 C（保持后置 + SSRR 优化，无分页） | 3（BatchGetTraces、BatchGetTraceInfos、ListScorers） | 保持后置过滤 | 同上 |
 | **request_filter（已有前置过滤）** | **9 REST + 2 GraphQL** | **否 — 过滤机制已正确** | **是（数组参数端点受益，单参数端点无批量收益）** |
 | broad_only | 7 | 否 — 设计如此 | 否 — 不涉及 resource_name 检查 |
 | 单资源 + resource_name_parsers | 4 个 list 端点 | 否 — 单资源验证 | 否 — 单个 ID 无批量收益 |

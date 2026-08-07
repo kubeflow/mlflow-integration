@@ -1,13 +1,33 @@
-# Upstream PR: 让 filter parser 支持 name IN (...)
+# Upstream changes: pre-request auth scoping for collection endpoints
 
-## 背景
+## Background
 
-mlflow-integration auth 插件要从后置过滤改为 SSRR 前置改写（RHOAIENG-74916）。
-前置改写的机制是：SSRR 拿到用户有权访问的 resource names → 注入 `filter_string="name IN ('a','b','c')"` → MLflow 只查这些资源。
+The MLflow auth plugins (both basic auth and K8s auth) currently use post-response filtering for collection endpoints: MLflow queries all data, returns it, then the auth layer filters out unauthorized items. This is inefficient — MLflow loads and serializes data the caller will never see.
 
-问题：MLflow 的 filter parser 有一个 `validate_list_supported` 守门函数，按端点类型决定哪些字段能用 `IN`。目前需要改的几个端点都不允许 `name IN (...)`。
+The goal is to move filtering into the MLflow storage layer (pre-request scoping): the auth layer tells MLflow which resources the caller is authorized to see **before** the query runs, so MLflow only loads authorized data.
 
-## 改动原理
+Core argument (applies to all auth plugins, not just K8s): if a user only has permission to 1 experiment out of 1000, MLflow shouldn't have to query all 1000 and filter out 999 just to honor a page_size=20 request.
+
+Two types of upstream changes are needed:
+1. **`name IN (...)` filter support** (Solution B) — extend the filter parser so auth can inject `filter_string="name IN ('a','b','c')"` for top-level resources
+2. **Optional `experiment_ids` parameter** (Solution A, subset) — add an `experiment_ids` param to 3 endpoints that currently lack one, so auth can scope by parent experiment
+
+## Upstream strategy (per PE review)
+
+1. **Open a GitHub issue first**, framed as: "Improve basic auth to prefilter based on user's permissions rather than post response filtering". Emphasize performance/pagination benefits — this benefits all auth plugins, not just K8s auth.
+2. **Implement API changes + refactor MLflow's basic auth plugin** to use pre-request scoping — the basic auth refactoring is a token of goodwill to the community, showing the changes benefit everyone.
+3. **Matthew can get Databricks MLflow maintainers to review**, since this impacts their managed offering.
+4. **Then follow the same approach in the K8s auth plugin** (Kubeflow/RHOAI).
+
+---
+
+## Part 1: `name IN (...)` filter support (Solution B endpoints)
+
+### Problem
+
+MLflow 的 filter parser 有一个 `validate_list_supported` 守门函数，按端点类型决定哪些字段能用 `IN`。目前需要改的几个端点都不允许 `name IN (...)`。
+
+### 改动原理
 
 filter parser 有两道门（都在 `mlflow/utils/search_utils.py`）：
 
@@ -25,7 +45,7 @@ elif isinstance(token, Parenthesis):
 
 SQL store 层已有通用的 IN 处理逻辑，不需要额外改动。
 
-## 需要改的类
+### 需要改的类
 
 ### 1. SearchExperimentsUtils（L1053）
 
@@ -202,27 +222,54 @@ elif (
 |---|---|---|---|---|
 | GraphQL mlflowSearchModelVersions | SearchModelVersionUtils | ❌ `name IN` 被阻止 | ✅ 需要 | **已确认可行（路径 B）**：GraphQL input `MlflowSearchModelVersionsInput` 有 `filter` 字段（`graphene.String()`），resolver 传给 `search_model_versions_impl` → 走同一个 `SearchModelVersionUtils` parser。上游 PR 放宽 `name IN` 后，auth 插件在 GraphQL middleware 注入 `filter` arg 即可。 |
 
-## 改动总量估计
+---
 
-当前已确认的 5 个类：
+## Part 2: Optional `experiment_ids` parameter (Solution A endpoints needing upstream changes)
+
+Three endpoints currently lack an `experiment_ids` parameter but have internal support for experiment-scoped queries. Adding an optional `experiment_ids` param lets the auth layer inject the authorized set and filter at the storage layer.
+
+### 1. BatchGetTraces / BatchGetTraceInfos
+
+**现状**：API 只接受 `trace_ids`，无 `experiment_ids` 参数。
+
+**内部支撑**：`trace_info` 已有 `experiment_id` 字段（数据库列已存在）。
+
+**改动**：
+- API 层：加 optional `experiment_ids` 参数
+- Store 层：查询时加 `WHERE experiment_id IN (...)` 条件
+
+**收益**：不仅是 auth scoping — 还避免加载无权 trace 的 span payload（可能很大），减少 DB I/O 和内存。
+
+### 2. ListScorers
+
+**现状**：API 只有单个 optional `experiment_id`，不传时查所有 workspace experiments 再过滤。
+
+**内部支撑**：`list_scorers_across_experiments(experiment_ids)` 已经存在且接受 ID 列表。
+
+**改动**：
+- API 层：加 optional `experiment_ids`（复数）参数
+- 内部调用从查所有 experiments 改为传入 authorized IDs → 直接调用 `list_scorers_across_experiments(experiment_ids)`
+
+**收益**：跳过"查所有 workspace experiments + 逐个获取 scorers + 后置过滤"的路径。
+
+---
+
+## 改动总量估计（合并）
+
+**Part 1 — filter parser（`mlflow/utils/search_utils.py`）**：
 - SearchExperimentsUtils — override `validate_list_supported`，~5 行
 - SearchMCPServerUtils — 扩展 `validate_list_supported`，~2 行
 - SearchMCPAccessEndpointUtils — 加 override `validate_list_supported`，~5 行
 - SearchModelUtils — 改 `_get_value()` 的 Parenthesis 分支，~2 行
 - SearchModelVersionUtils — 改 `_get_value()` 的 Parenthesis 分支，~2 行
 
-总共 ~16 行 parser 改动 + 配套单元测试。
-
-SQL store 改动（`mlflow/store/model_registry/sqlalchemy_store.py`）：
+**Part 1 — SQL store（`mlflow/store/model_registry/sqlalchemy_store.py`）**：
 - SearchRegisteredModels 的 filter 处理（L603）：加 `"IN"` 到白名单 + `attr.in_(value)` 逻辑，~5 行
 - SearchModelVersions 的 filter 处理（L690）：放宽 `key != "run_id"` 为 `key not in ("run_id", "name")`，~1 行
 
-涉及两个文件：
-- `mlflow/utils/search_utils.py`（5 个类）
-- `mlflow/store/model_registry/sqlalchemy_store.py`（2 处改动）
+**Part 2 — API + store changes**：
+- BatchGetTraces / BatchGetTraceInfos：API proto + store 层加 `experiment_ids` 过滤，待调研具体行数
+- ListScorers：API proto + 路由到 `list_scorers_across_experiments(experiment_ids)`，待调研具体行数
 
-## 上游提交策略
-
-- 一个 PR 包含所有 filter IN 改动
-- PR 标题建议：`Allow name IN (...) filter for experiments, registered models, model versions, MCP servers, and access endpoints`
-- 找 Matthew review（MLflow upstream maintainer）
+**Basic auth plugin refactoring**：
+- 改造 basic auth 的 collection filter 逻辑使用新的 pre-request scoping 机制，作为对社区的 goodwill，待调研具体行数

@@ -33,10 +33,10 @@ Column definitions:
 | Experiment | **SearchPromptOptimizationJobs** | request_filter_experiment_id | Caller passes single experiment_id → SSAR check → allowed or 403 | Filter mechanism unchanged; single ID, no batching benefit |
 | Experiment | **SearchIssues** (v3.11) | request_filter_experiment_id | Same as above | Same as above |
 | Experiment | **SearchTraces** | response_filter_traces | Pass through → per-item SSAR check on experiment → filter response | **Solution A** — API has `experiment_ids` array parameter |
-| Experiment | **BatchGetTraces** | response_filter_traces | Pass through → per-item SSAR check → filter response | Only has `trace_ids`, no experiment parameter, no pagination, no filter_string → **Solution C** |
-| Experiment | **BatchGetTraceInfos** (v3.11) | response_filter_traces | Same as above | Same as above → **Solution C** |
+| Experiment | **BatchGetTraces** | response_filter_traces | Pass through → per-item SSAR check → filter response | No `experiment_ids` param today; `trace_info` has `experiment_id` internally → upstream adds optional `experiment_ids` param → **Solution A** |
+| Experiment | **BatchGetTraceInfos** (v3.11) | response_filter_traces | Same as above | Same as above → **Solution A** |
 | Experiment | **SearchEvaluationDatasets** | response_filter_dataset_summaries | Pass through → per-item SSAR check on experiment → filter response | **Solution A** — API has `experiment_ids` array parameter |
-| Experiment | **ListScorers** (v3.13 hybrid) | response_filter_scorers (hybrid) | **With experiment_id**: SSAR checks that experiment → allowed or 403. **Without experiment_id**: pass through → per-item SSAR filter | No pagination (no page_token), single optional `experiment_id` → **Solution C** |
+| Experiment | **ListScorers** (v3.13 hybrid) | response_filter_scorers (hybrid) | **With experiment_id**: SSAR checks that experiment → allowed or 403. **Without experiment_id**: pass through → per-item SSAR filter | Internal `list_scorers_across_experiments(experiment_ids)` already accepts ID list; upstream exposes optional `experiment_ids` param → **Solution A** |
 
 ### RegisteredModel (top-level resource)
 
@@ -117,16 +117,32 @@ for item in items:                       allowed = SSRR("experiments", "get", ws
 
 ## Solution classification
 
-SSRR is a cross-cutting auth-backend optimization; the solutions below address the **filter mechanism** layer. All endpoints requiring changes fall into three solutions:
+SSRR is a cross-cutting auth-backend optimization; the solutions below address the **filter mechanism** layer.
+
+### Why different endpoints use different injection mechanisms
+
+The choice between injecting `experiment_ids` vs `filter_string` with `name IN (...)` is pragmatic, not categorical. Each endpoint uses whichever parameter requires the least upstream change:
+
+- SearchTraces, SearchEvaluationDatasets → API already has `experiment_ids` → inject it directly
+- BatchGetTraces, ListScorers → no existing parameter, but underlying store supports `experiment_id` filtering → upstream adds optional `experiment_ids` (per PE review feedback)
+- model-versions/search → is a sub-resource of RegisteredModel, but its `filter_string` already supports `name` and just needs `IN` → extend `filter_string` rather than add a new parameter
+- SearchExperiments, SearchRegisteredModels → `filter_string` already has `name` as a valid key, only missing `IN` operator → extend `filter_string`
+
+This means the mapping between resource hierarchy (sub-resource vs top-level) and injection mechanism (`experiment_ids` vs `filter_string`) is not clean — but forcing a uniform approach would create unnecessary upstream churn.
+
+All endpoints requiring changes fall into two solutions:
 
 ### Solution A: SSRR → inject scoping array parameter (pre-request rewrite)
 
-The API already has a narrowable array parameter (e.g. `experiment_ids`). SSRR fetches allowed resource names → convert to IDs → inject into array → MLflow queries only authorized data. **Pagination cursors remain correct** — the ideal approach.
+SSRR fetches allowed resource names → convert to IDs → inject into `experiment_ids` array → MLflow queries only authorized data. **Pagination cursors remain correct** — the ideal approach.
 
-| Endpoint | Injected parameter |
-|---|---|
-| SearchTraces | `experiment_ids` |
-| SearchEvaluationDatasets | `experiment_ids` |
+| Endpoint | Injected parameter | Upstream change needed? |
+|---|---|---|
+| SearchTraces | `experiment_ids` | No — parameter already exists |
+| SearchEvaluationDatasets | `experiment_ids` | No — parameter already exists |
+| BatchGetTraces | `experiment_ids` | Yes — add optional param; `trace_info` already has `experiment_id` internally, small extra `IN` filter at store layer |
+| BatchGetTraceInfos (v3.11) | `experiment_ids` | Yes — same as BatchGetTraces |
+| ListScorers (v3.13 hybrid) | `experiment_ids` | Yes — `list_scorers_across_experiments(experiment_ids)` already exists internally; expose as optional API param |
 
 ### Solution B: SSRR → inject filter_string (pre-request rewrite, requires upstream PR)
 
@@ -143,28 +159,7 @@ Upstream changes have been fully investigated (~20 lines of code + tests), spann
 | MCP servers list (v3.14) | `name IN (...)` | `SearchMCPServerUtils.validate_list_supported`: add `name` | Confirmed feasible |
 | MCP access endpoints (v3.14) | `server_name IN (...)` | `SearchMCPAccessEndpointUtils`: add `validate_list_supported` override | Confirmed feasible |
 
-### Solution C: keep post-response filtering + SSRR batch optimization (non-paginated endpoints)
-
-The API has **no pagination** (no `page_token`/`max_results`), so pagination cursor corruption is not a concern — post-response filtering is correct as-is. Optimization: replace **per-item SSAR** checks with **1 SSRR** call to batch-fetch the allowed resource name set (N K8s API calls → 1).
-
-```
-Current:                                After Solution C:
-
-for item in response:                   allowed = SSRR("experiments", "get", ws)
-  name = resolve(item.exp_id)           → {"exp-a", "exp-c", ...}    ← 1 K8s call
-  SSAR(name)  ← 1 K8s call each
-                                        for item in response:
-                                          name = resolve(item.exp_id)
-                                          name in allowed  ← set lookup, 0 K8s calls
-```
-
-| Endpoint | Why Solution C |
-|---|---|
-| BatchGetTraces | Only has `trace_ids`, no experiment parameter, no pagination |
-| BatchGetTraceInfos (v3.11) | Same as above |
-| ListScorers (v3.13 hybrid) | Single optional `experiment_id`, no pagination. With ID: already authorized by resource_name; without ID: this path applies |
-
-> **Note**: Solutions A/B/C all depend on SSRR to fetch the authorized scope. See the cross-cutting optimization section above for applicability and constraints.
+> **Note**: Solutions A and B both depend on SSRR to fetch the authorized scope. See the cross-cutting optimization section above for applicability and constraints.
 
 ---
 
@@ -173,9 +168,8 @@ for item in response:                   allowed = SSRR("experiments", "get", ws)
 | Category | Count | Filter mechanism change? | SSRR cross-cutting optimization? |
 |---|---|---|---|
 | **response_filter (this ticket's target)** | **11 + 1 GraphQL** | **Yes** | **Yes** |
-| Solution A (inject scoping array param) | 2 (SearchTraces, SearchEvaluationDatasets) | Approach confirmed | 1 SSRR replaces per-item SSAR |
-| Solution B (inject filter_string, upstream PR) | 5 REST + 1 GraphQL | Approach confirmed, upstream changes investigated (~20 lines) | Same |
-| Solution C (keep post-response + SSRR batch) | 3 (BatchGetTraces, BatchGetTraceInfos, ListScorers) | Keep post-response filtering | Same |
+| Solution A (inject `experiment_ids`) | 5 (SearchTraces, SearchEvaluationDatasets, BatchGetTraces, BatchGetTraceInfos, ListScorers) | 2 already have param; 3 need upstream API change | 1 SSRR replaces per-item SSAR |
+| Solution B (inject `filter_string`, upstream PR) | 5 REST + 1 GraphQL | Approach confirmed, upstream changes investigated (~20 lines) | Same |
 | **request_filter (existing pre-request filtering)** | **9 REST + 2 GraphQL** | **No — mechanism already correct** | **Yes (array-param endpoints benefit; single-param endpoints have no batching benefit)** |
 | broad_only | 7 | No — by design | No — no resource_name check involved |
 | Single-resource + resource_name_parsers | 4 list endpoints | No — single-resource validation | No — single ID, no batching benefit |
