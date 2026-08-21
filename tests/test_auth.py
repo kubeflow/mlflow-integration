@@ -1867,21 +1867,40 @@ def test_authorize_request_retries_with_resource_name_after_broad_denial(monkeyp
     assert second_call.kwargs == {"resource_name": "exp-a"}
 
 
-def test_authorize_request_allows_mcp_version_create_with_broad_update(monkeypatch):
-    authorizer = Mock()
-    authorizer.is_allowed.return_value = True
-    rule = AuthorizationRule(
+def _mcp_version_create_rule() -> AuthorizationRule:
+    """Matches the production rule for POST {prefix}/<name>/versions in rules_v3_14.py."""
+    return AuthorizationRule(
         "update",
         resource=RESOURCE_MCP_SERVERS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
+        create_verb_if_missing="create",
     )
+
+
+def _mock_mcp_server_store(*, exists: bool):
+    def _get_mcp_server(name):
+        if exists:
+            return SimpleNamespace(name=name)
+        raise MlflowException("not found", error_code=databricks_pb2.RESOURCE_DOES_NOT_EXIST)
+
+    return SimpleNamespace(get_mcp_server=_get_mcp_server)
+
+
+def test_authorize_request_allows_mcp_version_create_with_update_when_server_exists(monkeypatch):
+    """POST .../versions on an existing server is authorized via `update`, not `create`."""
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = True
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
-        lambda path, method, **kwargs: [rule],
+        lambda path, method, **kwargs: [_mcp_version_create_rule()],
     )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
         lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: _mock_mcp_server_store(exists=True),
     )
     _authorize_request(
         AuthorizationRequest(
@@ -1909,18 +1928,17 @@ def test_authorize_request_retries_mcp_version_create_with_named_update_when_bro
 ):
     authorizer = Mock()
     authorizer.is_allowed.side_effect = [False, True]
-    rule = AuthorizationRule(
-        "update",
-        resource=RESOURCE_MCP_SERVERS,
-        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
-    )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
-        lambda path, method, **kwargs: [rule],
+        lambda path, method, **kwargs: [_mcp_version_create_rule()],
     )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
         lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: _mock_mcp_server_store(exists=True),
     )
     _authorize_request(
         AuthorizationRequest(
@@ -1946,7 +1964,9 @@ def test_authorize_request_retries_mcp_version_create_with_named_update_when_bro
     assert second_call.kwargs == {"resource_name": "com.example/server"}
 
 
-def test_authorize_request_denies_mcp_version_create_without_update_access(monkeypatch):
+def test_authorize_request_denies_mcp_version_create_without_update_access_when_server_exists(
+    monkeypatch,
+):
     authorizer = Mock()
 
     def _is_allowed(_identity, resource, verb, workspace, subresource=None, *, resource_name=None):
@@ -1971,18 +1991,17 @@ def test_authorize_request_denies_mcp_version_create_without_update_access(monke
         )
 
     authorizer.is_allowed.side_effect = _is_allowed
-    rule = AuthorizationRule(
-        "update",
-        resource=RESOURCE_MCP_SERVERS,
-        resource_name_parsers=(RESOURCE_NAME_PARSER_MCP_SERVER_NAME,),
-    )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
-        lambda path, method, **kwargs: [rule],
+        lambda path, method, **kwargs: [_mcp_version_create_rule()],
     )
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
         lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: _mock_mcp_server_store(exists=True),
     )
     with pytest.raises(MlflowException, match="Permission denied for requested operation."):
         _authorize_request(
@@ -2007,6 +2026,89 @@ def test_authorize_request_denies_mcp_version_create_without_update_access(monke
     second_call = authorizer.is_allowed.call_args_list[1]
     assert second_call.args[1:] == (RESOURCE_MCP_SERVERS, "update", "team-a", None)
     assert second_call.kwargs == {"resource_name": "com.example/server"}
+
+
+def test_authorize_request_allows_mcp_version_create_with_create_access_when_server_missing(
+    monkeypatch,
+):
+    """POST .../versions on a server that doesn't exist yet is a create, not an update:
+    a user with only `create` access must be allowed to bring the server into existence."""
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = True
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [_mcp_version_create_rule()],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: _mock_mcp_server_store(exists=False),
+    )
+    _authorize_request(
+        AuthorizationRequest(
+            authorization_header="Bearer create-token",
+            forwarded_access_token=None,
+            remote_user_header_value=None,
+            remote_groups_header_value=None,
+            path="/api/3.0/mlflow/mcp-servers/com.example/new-server/versions",
+            method="POST",
+            workspace="team-a",
+            path_params={"name": "com.example/new-server"},
+        ),
+        authorizer=authorizer,
+        config_values=KubernetesAuthConfig(),
+    )
+
+    authorizer.is_allowed.assert_called_once()
+    only_call = authorizer.is_allowed.call_args_list[0]
+    assert only_call.args[1:] == (RESOURCE_MCP_SERVERS, "create", "team-a", None)
+    assert only_call.kwargs == {}
+
+
+def test_authorize_request_denies_mcp_version_create_with_update_only_access_when_server_missing(
+    monkeypatch,
+):
+    """Regression for the excess-privilege mirror bug: a user with only `update` (no
+    `create`) must not be able to create a brand new MCP server via POST .../versions."""
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [_mcp_version_create_rule()],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.core._parse_jwt_subject",
+        lambda token, claim: "k8s-user",
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.resource_names._get_tracking_store",
+        lambda: _mock_mcp_server_store(exists=False),
+    )
+    with pytest.raises(MlflowException, match="Permission denied for requested operation."):
+        _authorize_request(
+            AuthorizationRequest(
+                authorization_header="Bearer update-only-token",
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/api/3.0/mlflow/mcp-servers/com.example/new-server/versions",
+                method="POST",
+                workspace="team-a",
+                path_params={"name": "com.example/new-server"},
+            ),
+            authorizer=authorizer,
+            config_values=KubernetesAuthConfig(),
+        )
+
+    # Must check `create` only — never fall back to (or succeed via) `update` — when the
+    # server doesn't exist yet.
+    authorizer.is_allowed.assert_called_once()
+    only_call = authorizer.is_allowed.call_args_list[0]
+    assert only_call.args[1:] == (RESOURCE_MCP_SERVERS, "create", "team-a", None)
+    assert only_call.kwargs == {}
 
 
 def test_resolve_resource_names_resolves_experiment_ids_to_names(monkeypatch):

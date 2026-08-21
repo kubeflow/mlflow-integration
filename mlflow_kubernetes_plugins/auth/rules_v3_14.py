@@ -123,6 +123,7 @@ def apply_mcp_registry_deltas(
                 (f"{prefix}/<path:name>/versions", "POST"): _mcp_servers_rule(
                     "update",
                     resource_name_parsers=mcp_server_name_parsers,
+                    create_verb_if_missing="create",
                 ),
                 (f"{prefix}/<path:name>/versions", "GET"): _mcp_servers_rule(
                     "get",

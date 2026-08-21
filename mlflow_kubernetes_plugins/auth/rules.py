@@ -47,6 +47,12 @@ class AuthorizationRule(NamedTuple):
     # Skip generic gateway dependency checks when a rule reuses a gateway resource for
     # authorization shape but does not actually consume that resource's usual dependencies.
     skip_gateway_dependency_permissions: bool = False
+    # Some endpoints implicitly create a parent resource on first write (e.g. POST
+    # .../mcp-servers/<name>/versions creates the server if it doesn't exist yet). When set,
+    # the dispatcher checks this verb (broad, workspace-level only — no resource_name retry)
+    # instead of `verb` if the named resource does not already exist, mirroring MLflow's own
+    # validate_can_create_mcp_server() + _server_exists() gate in mlflow/server/auth/__init__.py.
+    create_verb_if_missing: str | None = None
 
 
 def _assistants_rule(verb: str | None, **kwargs) -> AuthorizationRule:

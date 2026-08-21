@@ -548,6 +548,18 @@ def _resolve_existing_gateway_secret_names_for_use(
     return ()
 
 
+def _mcp_server_exists(name: str) -> bool:
+    from mlflow_kubernetes_plugins.auth.resource_names import _get_tracking_store
+
+    try:
+        _get_tracking_store().get_mcp_server(name)
+        return True
+    except MlflowException as e:
+        if e.error_code == databricks_pb2.ErrorCode.Name(databricks_pb2.RESOURCE_DOES_NOT_EXIST):
+            return False
+        raise
+
+
 async def _enforce_gateway_budget_scope(
     request_context: AuthorizationRequest, rule: AuthorizationRule
 ) -> AuthorizationRequest:
@@ -731,10 +743,27 @@ async def _authorize_request_async(
                     "is missing an RBAC resource mapping.",
                     error_code=databricks_pb2.INTERNAL_ERROR,
                 )
+            effective_verb = rule.verb
+            skip_named_resource_retry = False
+            if rule.create_verb_if_missing is not None:
+                updated_request_context = await _ensure_request_context_json_body(
+                    updated_request_context
+                )
+                try:
+                    parent_resource_names = resolve_resource_names(
+                        updated_request_context, rule.resource_name_parsers
+                    )
+                except (ResourceReferenceNotPresentError, ResourceNameResolutionError):
+                    parent_resource_names = ()
+                if len(parent_resource_names) == 1 and not _mcp_server_exists(
+                    parent_resource_names[0]
+                ):
+                    effective_verb = rule.create_verb_if_missing
+                    skip_named_resource_retry = True
             has_permission = authorizer.is_allowed(
                 identity,
                 rule.resource,
-                rule.verb,
+                effective_verb,
                 resolved_workspace_name,
                 rule.subresource,
             )
@@ -751,7 +780,7 @@ async def _authorize_request_async(
             # This approach allows us to reuse cache SelfSubjectAccessReview of the common case
             # where a user has access to all resources to the workspace.
             resource_reference_missing = False
-            if not has_permission and rule.resource_name_parsers:
+            if not has_permission and rule.resource_name_parsers and not skip_named_resource_retry:
                 updated_request_context = await _ensure_request_context_json_body(
                     updated_request_context
                 )
@@ -766,7 +795,7 @@ async def _authorize_request_async(
                     resource_names = ()
                 except ResourceNameResolutionError:
                     resource_names = ()
-                resource_name_verb = rule.verb
+                resource_name_verb = effective_verb
                 has_permission = bool(resource_names) and all(
                     authorizer.is_allowed(
                         identity,
