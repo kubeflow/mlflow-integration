@@ -19,6 +19,44 @@ MLFLOW_TEST_IMAGE="${image_repository}:integration-$(date +%s)-${RANDOM}"
 
 mkdir -p "$(dirname "$JUNIT_XML")"
 created_cluster=false
+cluster_ready=false
+previous_context="$(kubectl config current-context 2>/dev/null || true)"
+test_namespace="${MLFLOW_TEST_NAMESPACE:-mlflow-tests}"
+workspace_a="${MLFLOW_TEST_WORKSPACE_A:-mlflow-workspace-a}"
+workspace_b="${MLFLOW_TEST_WORKSPACE_B:-mlflow-workspace-b}"
+hidden_workspace="${MLFLOW_TEST_HIDDEN_WORKSPACE:-mlflow-workspace-hidden}"
+
+clean_reused_cluster() {
+  helm uninstall mlflow --namespace mlflow --wait --timeout 5m || true
+  kubectl delete namespace mlflow "$test_namespace" "$workspace_a" "$workspace_b" \
+    "$hidden_workspace" --ignore-not-found --wait=true || true
+  kubectl delete clusterrole mlflow-workspace-discovery --ignore-not-found || true
+  kubectl delete clusterrolebinding workspace-a-discovery --ignore-not-found || true
+}
+
+cleanup() {
+  status=$?
+  if [[ "$cluster_ready" == true && "$status" != 0 ]]; then
+    mkdir -p test-results/diagnostics
+    kubectl get all --all-namespaces -o wide > test-results/diagnostics/resources.txt 2>&1 || true
+    kubectl get events --all-namespaces --sort-by=.lastTimestamp > test-results/diagnostics/events.txt 2>&1 || true
+    kubectl describe pods --all-namespaces > test-results/diagnostics/pods.txt 2>&1 || true
+    kubectl logs deployment/mlflow --namespace mlflow > test-results/diagnostics/mlflow.log 2>&1 || true
+  fi
+  if [[ "$cluster_ready" == true && "$created_cluster" != true ]]; then
+    clean_reused_cluster
+  fi
+  if [[ "$created_cluster" == true ]]; then
+    kind delete cluster --name "$KIND_CLUSTER_NAME" || true
+  fi
+  if [[ -n "$previous_context" ]]; then
+    kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
+  else
+    kubectl config unset current-context >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 
 if ! kind get clusters | grep -Fxq "$KIND_CLUSTER_NAME"; then
   kind create cluster --name "$KIND_CLUSTER_NAME" --wait 2m
@@ -26,22 +64,10 @@ if ! kind get clusters | grep -Fxq "$KIND_CLUSTER_NAME"; then
 fi
 kubectl config use-context "kind-$KIND_CLUSTER_NAME"
 kubectl cluster-info --context "kind-$KIND_CLUSTER_NAME" >/dev/null
-
-cleanup() {
-  status=$?
-  if (( status != 0 )); then
-    mkdir -p test-results/diagnostics
-    kubectl get all --all-namespaces -o wide > test-results/diagnostics/resources.txt 2>&1 || true
-    kubectl get events --all-namespaces --sort-by=.lastTimestamp > test-results/diagnostics/events.txt 2>&1 || true
-    kubectl describe pods --all-namespaces > test-results/diagnostics/pods.txt 2>&1 || true
-    kubectl logs deployment/mlflow --namespace mlflow > test-results/diagnostics/mlflow.log 2>&1 || true
-  fi
-  if [[ "$created_cluster" == true ]]; then
-    kind delete cluster --name "$KIND_CLUSTER_NAME" || true
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
+cluster_ready=true
+if [[ "$created_cluster" != true ]]; then
+  clean_reused_cluster
+fi
 
 "${CONTAINER_TOOL:-docker}" build -f tests/kind/Dockerfile -t "$MLFLOW_TEST_IMAGE" .
 kind load docker-image "$MLFLOW_TEST_IMAGE" --name "$KIND_CLUSTER_NAME"
