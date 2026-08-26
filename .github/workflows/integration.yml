@@ -11,6 +11,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "Makefile"
+      - ".github/workflows/integration.yml"
   workflow_dispatch:
 
 permissions:

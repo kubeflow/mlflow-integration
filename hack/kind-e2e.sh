@@ -5,6 +5,18 @@ set -euo pipefail
 : "${MLFLOW_TEST_IMAGE:=mlflow-integration:integration}"
 : "${JUNIT_XML:=test-results/mlflow-integration.xml}"
 
+image_name="${MLFLOW_TEST_IMAGE##*/}"
+if [[ "$MLFLOW_TEST_IMAGE" == *@* || "$image_name" != *:* ]]; then
+  echo "MLFLOW_TEST_IMAGE must be a tagged image reference" >&2
+  exit 1
+fi
+image_repository="${MLFLOW_TEST_IMAGE%:*}"
+if [[ -z "$image_repository" || -z "${MLFLOW_TEST_IMAGE##*:}" ]]; then
+  echo "MLFLOW_TEST_IMAGE must be a tagged image reference" >&2
+  exit 1
+fi
+MLFLOW_TEST_IMAGE="${image_repository}:integration-$(date +%s)-${RANDOM}"
+
 mkdir -p "$(dirname "$JUNIT_XML")"
 created_cluster=false
 
@@ -36,9 +48,9 @@ kind load docker-image "$MLFLOW_TEST_IMAGE" --name "$KIND_CLUSTER_NAME"
 helm upgrade --install mlflow charts/mlflow \
   --namespace mlflow --create-namespace --wait --timeout 5m \
   -f tests/kind/values-e2e.yaml \
-  --set image.repository="${MLFLOW_TEST_IMAGE%%:*}" \
-  --set image.tag="${MLFLOW_TEST_IMAGE#*:}"
+  --set image.repository="${MLFLOW_TEST_IMAGE%:*}" \
+  --set-string image.tag="${MLFLOW_TEST_IMAGE##*:}"
 
-kubectl wait --for=condition=available deployment/mlflow --namespace mlflow --timeout=180s
+kubectl rollout status deployment/mlflow --namespace mlflow --timeout=180s
 MLFLOW_INTEGRATION=1 MLFLOW_TEST_IMAGE="$MLFLOW_TEST_IMAGE" \
   uv run pytest tests/integration -m integration -v --junitxml="$JUNIT_XML"

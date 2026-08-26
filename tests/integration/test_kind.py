@@ -246,6 +246,15 @@ def run_pod(
             "volumes": [{"name": "client", "configMap": {"name": "mlflow-integration-client"}}],
         },
     }
+    kubectl(
+        "delete",
+        "pod",
+        name,
+        "--namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=true",
+    )
     kubectl("apply", "-f", "-", input_text=json.dumps(manifest))
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:

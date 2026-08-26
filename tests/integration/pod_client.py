@@ -129,6 +129,8 @@ def run_cross_workspace_scenario() -> None:
         assert "PERMISSION_DENIED" in str(exc) or "Permission denied" in str(exc)
     else:
         assert source_experiment not in {experiment.name for experiment in experiments}
+    _assert_denied_or_empty(current.search_experiments)
+    _assert_denied_or_empty(current.search_registered_models)
     _assert_denied(lambda: current.create_experiment(f"cross-must-not-create-{WORKSPACE}"))
     print("cross-workspace scenario passed")
 
