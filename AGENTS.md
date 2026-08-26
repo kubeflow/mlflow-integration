@@ -40,6 +40,9 @@ helm package charts/mlflow --destination /tmp  # Build a local chart archive
 
 # Pre-commit
 uv run pre-commit run --all-files              # Run all hooks
+
+# Live integration
+make kind-e2e                                    # Build the PR image and run the Kind smoke suite
 ```
 
 ## Key Conventions
