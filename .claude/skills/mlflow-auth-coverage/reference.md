@@ -10,7 +10,7 @@ Bump the MLflow upper bound to include the target version:
 
 ```toml
 # For 3.XX coverage, set the ceiling to <3.(XX+1).0
-"mlflow>=3.10.0,<3.15.0",
+"mlflow>=3.10.0,<3.16.0",
 ```
 
 The tight upper bound is intentional for a security plugin — it prevents the plugin from silently accepting a new MLflow version with unprotected endpoints.
