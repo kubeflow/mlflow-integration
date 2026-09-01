@@ -69,6 +69,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MCP_REGISTRY,
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
+    HAS_MLFLOW_3_15_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -76,6 +77,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     CreateGatewayGuardrail,
     CreateIssue,
     CreateLabelSchema,
+    CreatePresignedDownloadUrl,
     CreatePresignedUploadUrl,
     CreateReviewQueue,
     DeleteGatewayBudgetPolicy,
@@ -195,10 +197,8 @@ from mlflow_kubernetes_plugins.auth.rules import (
     AuthorizationRule,
     _normalize_rules,
 )
-from mlflow_kubernetes_plugins.auth.rules_v3_14 import (
-    apply_mcp_registry_deltas,
-    apply_v3_14_deltas,
-)
+from mlflow_kubernetes_plugins.auth.rules_v3_14 import apply_v3_14_deltas
+from mlflow_kubernetes_plugins.auth.rules_v3_15 import apply_mcp_registry_deltas
 
 from conftest import _authorize_request
 
@@ -3371,6 +3371,38 @@ def test_mlflow_314_request_authorization_rules_cover_new_endpoints():
     )
 
 
+def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
+    if not HAS_MLFLOW_3_15_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.15 request classes.")
+
+    assert REQUEST_AUTHORIZATION_RULES[CreatePresignedDownloadUrl] == AuthorizationRule(
+        "get",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_RUN_ID_TO_EXPERIMENT_NAME,),
+    )
+
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/permission", "POST")
+    ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/providers", "GET")
+    ] == AuthorizationRule("get", resource=RESOURCE_ASSISTANTS)
+
+    artifact_path_parsers = (RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,)
+    artifact_get_rule = AuthorizationRule(
+        "get", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+    )
+    artifact_put_rule = AuthorizationRule(
+        "update", resource=RESOURCE_EXPERIMENTS, resource_name_parsers=artifact_path_parsers
+    )
+    for prefix in (
+        "/api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>",
+        "/ajax-api/2.0/mlflow-artifacts/artifacts/<path:artifact_path>",
+    ):
+        assert PATH_AUTHORIZATION_RULES[(prefix, "GET")] == artifact_get_rule
+        assert PATH_AUTHORIZATION_RULES[(prefix, "PUT")] == artifact_put_rule
+
+
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
     get_job_rule = PATH_AUTHORIZATION_RULES[("/ajax-api/3.0/mlflow/jobs/<job_id>", "GET")]
     cancel_job_rule = PATH_AUTHORIZATION_RULES[
@@ -5049,10 +5081,9 @@ def test_apply_mcp_registry_deltas_registers_routes_independently():
     )
 
 
-def test_apply_v3_14_deltas_skips_mcp_rules_without_registry(monkeypatch):
+def test_apply_v3_14_deltas_do_not_register_mcp_routes():
     request_authorization_rules = {}
     path_authorization_rules = {}
-    monkeypatch.setattr("mlflow_kubernetes_plugins.auth.rules_v3_14.HAS_MCP_REGISTRY", False)
 
     apply_v3_14_deltas(
         request_authorization_rules=request_authorization_rules,

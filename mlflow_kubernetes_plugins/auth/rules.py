@@ -10,6 +10,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_12_AUTH_SURFACE,
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
+    HAS_MLFLOW_3_15_AUTH_SURFACE,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     ALLOWED_RESOURCES,
@@ -128,9 +129,10 @@ from mlflow_kubernetes_plugins.auth.rules_base import (  # noqa: E402
 from mlflow_kubernetes_plugins.auth.rules_v3_11 import apply_v3_11_deltas  # noqa: E402
 from mlflow_kubernetes_plugins.auth.rules_v3_12 import apply_v3_12_deltas  # noqa: E402
 from mlflow_kubernetes_plugins.auth.rules_v3_13 import apply_v3_13_deltas  # noqa: E402
-from mlflow_kubernetes_plugins.auth.rules_v3_14 import (  # noqa: E402
+from mlflow_kubernetes_plugins.auth.rules_v3_14 import apply_v3_14_deltas  # noqa: E402
+from mlflow_kubernetes_plugins.auth.rules_v3_15 import (  # noqa: E402
     apply_mcp_registry_deltas,
-    apply_v3_14_deltas,
+    apply_v3_15_deltas,
 )
 
 REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[AuthorizationRule, ...]] = dict(
@@ -155,12 +157,17 @@ if HAS_MLFLOW_3_13_AUTH_SURFACE:
         request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
         path_authorization_rules=PATH_AUTHORIZATION_RULES,
     )
-if HAS_MCP_REGISTRY and not HAS_MLFLOW_3_14_AUTH_SURFACE:
+if HAS_MCP_REGISTRY and not HAS_MLFLOW_3_15_AUTH_SURFACE:
     apply_mcp_registry_deltas(
         path_authorization_rules=PATH_AUTHORIZATION_RULES,
     )
 if HAS_MLFLOW_3_14_AUTH_SURFACE:
     apply_v3_14_deltas(
+        request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
+        path_authorization_rules=PATH_AUTHORIZATION_RULES,
+    )
+if HAS_MLFLOW_3_15_AUTH_SURFACE:
+    apply_v3_15_deltas(
         request_authorization_rules=REQUEST_AUTHORIZATION_RULES,
         path_authorization_rules=PATH_AUTHORIZATION_RULES,
     )
