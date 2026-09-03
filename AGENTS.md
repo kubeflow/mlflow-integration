@@ -25,7 +25,7 @@ make python-typecheck                          # Type-check entire project
 uv run ty check path/to/file.py                # Type-check single file
 
 # Testing
-make python-test                               # Run all tests
+make python-test                               # Run the default test suite (excludes integration)
 uv run pytest tests/test_auth.py               # Run single test file
 uv run pytest tests/test_auth.py -k "pattern"  # Run tests matching pattern
 
@@ -40,6 +40,9 @@ helm package charts/mlflow --destination /tmp  # Build a local chart archive
 
 # Pre-commit
 uv run pre-commit run --all-files              # Run all hooks
+
+# Live integration
+make kind-e2e                                    # Build the PR image and run the Kind smoke suite
 ```
 
 ## Key Conventions

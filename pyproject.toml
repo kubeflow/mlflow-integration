@@ -64,6 +64,10 @@ mlflow_kubernetes_plugins = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["-m", "not integration"]
+markers = [
+  "integration: live Kubernetes integration tests (opt in with MLFLOW_INTEGRATION=1)",
+]
 
 [tool.ty.environment]
 python-version = "3.12"

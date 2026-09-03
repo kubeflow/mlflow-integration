@@ -1,0 +1,23 @@
+# Local Kind profile for direct ServiceAccount authentication and file artifacts.
+image:
+  repository: mlflow-integration
+  tag: integration
+  pullPolicy: IfNotPresent
+
+mlflow:
+  backendStoreUri: "sqlite:////mlflow/mlflow.db"
+  artifactsDestination: "file:///mlflow/artifacts"
+  authorizationMode: self_subject_access_review
+  workspaceLabelSelector: "mlflow-enabled=true"
+  workspaceStoreUri: "kubernetes://"
+
+storage:
+  enabled: true
+  size: 2Gi
+
+tls:
+  enabled: false
+networkPolicy:
+  enabled: false
+metrics:
+  enabled: false
