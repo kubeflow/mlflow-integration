@@ -8,3 +8,6 @@ build
 dist
 *.db
 *.pyc
+.env
+.envrc
+test-results/

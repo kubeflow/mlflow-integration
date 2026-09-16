@@ -19,6 +19,12 @@ make install-dev
 make kind-e2e
 ```
 
+For Podman, use `CONTAINER_TOOL=podman make kind-e2e`. The runner selects the
+matching Kind provider and qualifies local image names consistently. Every run
+uses a unique image tag and an isolated kubeconfig. An existing cluster name is
+rejected rather than deleting potentially unrelated namespaces or releases.
+The owned cluster is removed on success or failure, including partial creation.
+
 `make python-test` does not create a cluster and remains the fast unit suite.
 The runner writes JUnit output to `test-results/` and captures Kubernetes
 resources, events, pod descriptions, and server logs when a test fails.

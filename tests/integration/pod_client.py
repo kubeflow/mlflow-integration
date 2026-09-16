@@ -121,14 +121,8 @@ def run_cross_workspace_scenario() -> None:
     os.environ["MLFLOW_TRACKING_TOKEN"] = TOKEN
     mlflow.set_workspace(WORKSPACE)
     current = client()
-    source_experiment = f"integration-{os.environ.get('SOURCE_WORKSPACE', WORKSPACE)}"
-    mlflow.set_workspace(WORKSPACE)
-    try:
-        experiments = current.search_experiments()
-    except MlflowException as exc:
-        assert "PERMISSION_DENIED" in str(exc) or "Permission denied" in str(exc)
-    else:
-        assert source_experiment not in {experiment.name for experiment in experiments}
+    _assert_denied_or_empty(current.search_experiments)
+    _assert_denied_or_empty(current.search_registered_models)
     _assert_denied(lambda: current.create_experiment(f"cross-must-not-create-{WORKSPACE}"))
     print("cross-workspace scenario passed")
 

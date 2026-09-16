@@ -7,10 +7,13 @@ on:
       - "charts/mlflow/**"
       - "tests/integration/**"
       - "tests/kind/**"
+      - "tests/test_kind_runner.py"
       - "hack/kind-e2e.sh"
+      - ".dockerignore"
       - "pyproject.toml"
       - "uv.lock"
       - "Makefile"
+      - ".github/workflows/integration.yml"
   workflow_dispatch:
 
 permissions:
@@ -32,8 +35,7 @@ jobs:
           enable-cache: true
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
-          cluster_name: mlflow-integration
-          wait: 2m
+          install_only: true
       - name: Install test dependencies
         run: uv sync --extra dev
       - name: Run MLflow functional tests

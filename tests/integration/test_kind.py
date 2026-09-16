@@ -25,7 +25,7 @@ HIDDEN_WORKSPACE = os.environ.get("MLFLOW_TEST_HIDDEN_WORKSPACE", "mlflow-worksp
 EDIT_SERVICE_ACCOUNT = "workspace-a-edit"
 EDIT_B_SERVICE_ACCOUNT = "workspace-b-edit"
 VIEW_SERVICE_ACCOUNT = "workspace-a-view"
-IMAGE = os.environ.get("MLFLOW_TEST_IMAGE", "mlflow-integration:test")
+IMAGE = os.environ.get("MLFLOW_TEST_IMAGE", "mlflow-integration:integration")
 TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://mlflow.mlflow.svc.cluster.local:5000")
 CLIENT_FILE = Path(__file__).with_name("pod_client.py")
 
@@ -246,6 +246,15 @@ def run_pod(
             "volumes": [{"name": "client", "configMap": {"name": "mlflow-integration-client"}}],
         },
     }
+    kubectl(
+        "delete",
+        "pod",
+        name,
+        "--namespace",
+        NAMESPACE,
+        "--ignore-not-found",
+        "--wait=true",
+    )
     kubectl("apply", "-f", "-", input_text=json.dumps(manifest))
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
