@@ -4,12 +4,14 @@ on:
   pull_request:
     paths:
       - "charts/**"
+      - "tests/test_helm_networkpolicy.py"
       - ".github/workflows/helm-ci.yml"
   push:
     branches:
       - main
     paths:
       - "charts/**"
+      - "tests/test_helm_networkpolicy.py"
       - ".github/workflows/helm-ci.yml"
   workflow_dispatch:
 
@@ -52,6 +54,11 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Verify configurable network ingress
+        run: uv run --isolated --no-project --with pytest --with PyYAML python -m pytest --noconftest tests/test_helm_networkpolicy.py
 
       - name: Template standalone profile
         run: |

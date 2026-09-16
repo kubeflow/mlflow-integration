@@ -14,6 +14,9 @@ spec:
     - Ingress
     - Egress
   ingress:
+    {{- if .Values.networkPolicy.ingressRules }}
+    {{- toYaml .Values.networkPolicy.ingressRules | nindent 4 }}
+    {{- else }}
     - ports:
         - protocol: TCP
           port: {{ .Values.mlflow.port }}
@@ -28,6 +31,7 @@ spec:
       from:
         - podSelector: {}
         - namespaceSelector: {}
+    {{- end }}
   egress:
     {{- if .Values.networkPolicy.egressRules }}
     {{- toYaml .Values.networkPolicy.egressRules | nindent 4 }}

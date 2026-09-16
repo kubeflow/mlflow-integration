@@ -45,7 +45,16 @@ helm upgrade --install mlflow charts/mlflow \
 
 See [`values.yaml`](values.yaml) for all configuration options and `ci/` for
 standalone, multi-user, and optional-workload examples. For production,
-provide remote backend and artifact stores through a custom values file.
+provide remote backend and artifact stores through a custom values file. When
+`networkPolicy.enabled` is true, set `networkPolicy.ingressRules` to restrict
+allowed source namespaces; an empty list preserves the standalone-compatible
+allow-all ingress default. NetworkPolicy controls network reachability, not user
+authorization. An Istio AuthorizationPolicy can restrict requests to a trusted
+gateway principal. With `mlflow.authorizationMode=subject_access_review`, the
+plugin then authorizes the gateway-provided user and groups through Kubernetes
+SubjectAccessReviews. Direct-token deployments instead use
+`self_subject_access_review`; do not treat caller-supplied identity headers as
+authenticated identities on an unrestricted Service.
 
 ## Uninstalling
 
