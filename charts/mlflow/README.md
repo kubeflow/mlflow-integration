@@ -56,6 +56,14 @@ SubjectAccessReviews. Direct-token deployments instead use
 `self_subject_access_review`; do not treat caller-supplied identity headers as
 authenticated identities on an unrestricted Service.
 
+## Validation
+
+The chart smoke test builds the production Dockerfile with the checked-out
+plugin, loads a commit-tagged image into Kind, and installs the chart with
+`image.pullPolicy=Never`. It checks Deployment readiness and the health endpoint
+without depending on the published `latest` image. This validates the checkout,
+not an existing release image or the complete Kubeflow gateway integration.
+
 ## Uninstalling
 
 ```bash

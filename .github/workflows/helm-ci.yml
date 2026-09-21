@@ -4,6 +4,13 @@ on:
   pull_request:
     paths:
       - "charts/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "README.md"
+      - "LICENSE"
+      - "mlflow_kubernetes_plugins/**"
+      - "tests/test_helm_ci.py"
       - "tests/test_helm_networkpolicy.py"
       - ".github/workflows/helm-ci.yml"
   push:
@@ -11,6 +18,13 @@ on:
       - main
     paths:
       - "charts/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "README.md"
+      - "LICENSE"
+      - "mlflow_kubernetes_plugins/**"
+      - "tests/test_helm_ci.py"
       - "tests/test_helm_networkpolicy.py"
       - ".github/workflows/helm-ci.yml"
   workflow_dispatch:
@@ -57,8 +71,8 @@ jobs:
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
-      - name: Verify configurable network ingress
-        run: uv run --isolated --no-project --with pytest --with PyYAML python -m pytest --noconftest tests/test_helm_networkpolicy.py
+      - name: Verify chart regression tests
+        run: uv run --isolated --no-project --with pytest --with PyYAML python -m pytest --noconftest tests/test_helm_networkpolicy.py tests/test_helm_ci.py
 
       - name: Template standalone profile
         run: |
@@ -224,6 +238,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: helm-template
     timeout-minutes: 15
+    env:
+      MLFLOW_TEST_IMAGE: mlflow-chart:${{ github.sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -236,6 +252,11 @@ jobs:
           version: v0.29.0
           cluster_name: mlflow-chart
 
+      - name: Build and load MLflow image
+        run: |
+          docker build --tag "$MLFLOW_TEST_IMAGE" .
+          kind load docker-image "$MLFLOW_TEST_IMAGE" --name mlflow-chart
+
       - name: Install MLflow chart
         run: |
           helm upgrade --install mlflow charts/mlflow \
@@ -243,6 +264,9 @@ jobs:
             --create-namespace \
             --wait \
             --timeout 5m \
+            --set-string image.repository="${MLFLOW_TEST_IMAGE%:*}" \
+            --set-string image.tag="${MLFLOW_TEST_IMAGE##*:}" \
+            --set image.pullPolicy=Never \
             -f charts/mlflow/ci/values-standalone.yaml
           kubectl rollout status deployment/mlflow \
             --namespace mlflow \
