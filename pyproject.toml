@@ -27,9 +27,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "mlflow>=3.10.0,<3.16.0",
+  "mlflow>=3.10.0,<3.17.0",
   "kubernetes>=29.0.0",
-  "graphql-core>=3.2.0",
+  "graphql-core>=3.2.0,<3.3",
 ]
 
 [project.urls]

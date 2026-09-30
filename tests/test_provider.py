@@ -181,6 +181,17 @@ def test_get_workspace_missing_namespace_uses_ui_compatible_prefix(core_api):
     assert "Each MLflow workspace maps 1:1 to a namespace." in exc.value.message
 
 
+@pytest.mark.parametrize("mode", [None, "RESTRICT", "SET_DEFAULT", "CASCADE"])
+def test_workspace_deletion_remains_unsupported_with_deletion_mode(core_api, mode):
+    provider = KubernetesWorkspaceProvider()
+    with pytest.raises(NotImplementedError, match="Namespace deletion is not supported"):
+        if mode is None:
+            provider.delete_workspace("team-a")
+        else:
+            provider.delete_workspace("team-a", mode=mode)
+    core_api.delete_namespace.assert_not_called()
+
+
 def test_get_default_workspace_env(core_api, monkeypatch):
     monkeypatch.setenv("MLFLOW_K8S_DEFAULT_WORKSPACE", "shared")
     core_api.list_namespace.return_value = SimpleNamespace(

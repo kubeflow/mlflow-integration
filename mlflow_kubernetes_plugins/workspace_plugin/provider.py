@@ -171,7 +171,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
     def update_workspace(self, workspace: Workspace) -> Workspace:  # type: ignore[override]
         raise NotImplementedError("Namespace updates are not supported by this provider")
 
-    def delete_workspace(self, workspace_name: str) -> None:  # type: ignore[override]
+    def delete_workspace(self, workspace_name: str, mode: str = "RESTRICT") -> None:
         raise NotImplementedError("Namespace deletion is not supported by this provider")
 
     def get_default_workspace(self) -> Workspace:  # type: ignore[override]

@@ -166,9 +166,18 @@ def _validate_fastapi_route_authorization(fastapi_app: FastAPI) -> None:
     """Ensure all protected FastAPI routes are covered by authorization rules."""
     missing: list[tuple[str, str]] = []
 
-    for route in getattr(fastapi_app, "routes", []):
-        if not isinstance(route, APIRoute):
-            continue
+    def api_routes():
+        for route in fastapi_app.routes:
+            if isinstance(route, APIRoute):
+                yield route
+            elif callable(contexts := getattr(route, "effective_route_contexts", None)):
+                # Newer FastAPI keeps included routers lazy. Effective contexts retain
+                # the full inclusion prefix, including nested routers and static prefixes.
+                for context in contexts():
+                    if isinstance(context.original_route, APIRoute):
+                        yield context
+
+    for route in api_routes():
         methods = getattr(route, "methods", set()) or set()
         canonical_path = _canonicalize_path(raw_path=route.path or "")
         if not canonical_path or _is_unprotected_path(canonical_path):

@@ -127,6 +127,8 @@ _STATIC_PREFIX_APPLICABLE_PREFIXES: tuple[str, ...] = (
     "/model-versions/get-artifact",
     "/static-files",
     "/graphql",
+    "/gateway",
+    "/v1/traces",
 )
 
 

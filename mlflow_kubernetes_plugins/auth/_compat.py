@@ -21,6 +21,7 @@ HAS_MLFLOW_3_12_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.12.0.dev0")
 HAS_MLFLOW_3_13_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.13.0.dev0")
 HAS_MLFLOW_3_14_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.14.0.dev0")
 HAS_MLFLOW_3_15_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.15.0.dev0")
+HAS_MLFLOW_3_16_AUTH_SURFACE = MLFLOW_VERSION >= Version("3.16.0.dev0")
 HAS_MCP_REGISTRY = _module_exists("mlflow.server.mcp_server_api")
 
 if HAS_MLFLOW_3_11_AUTH_SURFACE:
@@ -133,6 +134,7 @@ __all__ = [
     "HAS_MLFLOW_3_13_AUTH_SURFACE",
     "HAS_MLFLOW_3_14_AUTH_SURFACE",
     "HAS_MLFLOW_3_15_AUTH_SURFACE",
+    "HAS_MLFLOW_3_16_AUTH_SURFACE",
     "HAS_MCP_REGISTRY",
     "ListEndpointGuardrailConfigs",
     "ListGatewayGuardrails",

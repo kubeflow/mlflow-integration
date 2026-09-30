@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import mlflow_kubernetes_plugins.auth.middleware as middleware_mod
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.testclient import TestClient
 from flask import Flask
@@ -18,7 +18,7 @@ from mlflow.protos import databricks_pb2
 from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 from mlflow.utils import workspace_context
 from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
-from mlflow_kubernetes_plugins.auth._compat import HAS_MCP_REGISTRY
+from mlflow_kubernetes_plugins.auth._compat import HAS_MCP_REGISTRY, HAS_MLFLOW_3_16_AUTH_SURFACE
 from mlflow_kubernetes_plugins.auth.authorizer import (
     AuthorizationMode,
     KubernetesAuthConfig,
@@ -1267,6 +1267,70 @@ def test_fastapi_route_validation_fails_for_missing_rule():
         _validate_fastapi_route_authorization(app)
 
 
+def test_fastapi_route_validation_rejects_uncovered_included_router():
+    app = FastAPI()
+    parent = APIRouter()
+    child = APIRouter()
+
+    @child.get("/uncovered", include_in_schema=False)
+    async def _missing():
+        return {}
+
+    parent.include_router(child, prefix="/nested")
+    app.include_router(parent, prefix="/gateway")
+
+    with pytest.raises(MlflowException, match="GET /gateway/nested/uncovered"):
+        _validate_fastapi_route_authorization(app)
+
+
+@pytest.mark.parametrize("broad_access", [False, True])
+@pytest.mark.parametrize("static_prefix", ["", "/mlflow"])
+def test_fastapi_gateway_model_listing_filters_endpoint_names(
+    mock_authorizer, mock_config, broad_access, static_prefix, monkeypatch
+):
+    if not HAS_MLFLOW_3_16_AUTH_SURFACE:
+        pytest.skip("Installed MLflow does not expose the 3.16 gateway model listing.")
+
+    app = FastAPI()
+    monkeypatch.setenv("_MLFLOW_STATIC_PREFIX", static_prefix)
+    payload = {"object": "list", "data": [{"id": "visible"}, {"id": "hidden"}]}
+
+    @app.get(f"{static_prefix}/gateway/mlflow/v1/models")
+    async def models():
+        return payload
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    mock_authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        broad_access or kwargs.get("resource_name") == "visible"
+    )
+
+    with patch("mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", return_value="test-user"):
+        response = TestClient(app).get(
+            f"{static_prefix}/gateway/mlflow/v1/models",
+            headers={"Authorization": "Bearer valid-token", WORKSPACE_HEADER_NAME: "team-a"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == (
+        payload if broad_access else {"object": "list", "data": [{"id": "visible"}]}
+    )
+    assert all(
+        call.args[1:4] == ("gatewayendpoints", "get", "team-a")
+        for call in mock_authorizer.is_allowed.call_args_list
+    )
+
+
 def test_fastapi_route_validation_rejects_unknown_nested_mcp_route():
     app = FastAPI()
 
@@ -1276,6 +1340,54 @@ def test_fastapi_route_validation_rejects_unknown_nested_mcp_route():
 
     with pytest.raises(MlflowException, match="mcp-servers/.*/unlisted-child"):
         _validate_fastapi_route_authorization(app)
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_fastapi_typesafe_invocation_requires_named_endpoint_use(
+    mock_authorizer, mock_config, allowed
+):
+    if not HAS_MLFLOW_3_16_AUTH_SURFACE:
+        pytest.skip("Installed MLflow does not expose the 3.16 TypeSafe route.")
+
+    app = FastAPI()
+    handler = Mock()
+
+    @app.post("/gateway/typesafe/v1/systemone")
+    async def invoke():
+        handler()
+        return {"ok": True}
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    mock_authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        allowed
+        and args[1:5] == ("gatewayendpoints", "create", "team-a", "use")
+        and kwargs.get("resource_name") == "endpoint-a"
+    )
+
+    with patch("mlflow_kubernetes_plugins.auth.core._parse_jwt_subject", return_value="test-user"):
+        response = TestClient(app).post(
+            "/gateway/typesafe/v1/systemone",
+            headers={"Authorization": "Bearer valid-token", WORKSPACE_HEADER_NAME: "team-a"},
+            json={"model": "endpoint-a", "state": {}, "questions": []},
+        )
+
+    assert response.status_code == (200 if allowed else 403)
+    assert handler.call_count == int(allowed)
+    assert any(
+        call.kwargs.get("resource_name") == "endpoint-a"
+        for call in mock_authorizer.is_allowed.call_args_list
+    )
 
 
 def test_create_app_wraps_flask_with_fastapi(monkeypatch):

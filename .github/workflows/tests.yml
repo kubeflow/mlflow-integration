@@ -88,15 +88,14 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
         # Keep quoted so YAML does not coerce 3.10 to 3.1.
-        mlflow-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        mlflow-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15", "3.16"]
         exclude:
           - python-version: "3.14"
             mlflow-version: "3.14"
         include:
-          # Temporary baseline. Once request-side collection scoping lands, rebase on MLflow 3.17
-          # and replace this entry with "3.17".
+          # Pin the upstream source used by the OpenShift scale-testing image.
           - python-version: "3.12"
-            mlflow-version: "upstream-pre-request-auth"
+            mlflow-version: "upstream-scale-testing"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -107,12 +106,12 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          if [[ "${{ matrix.mlflow-version }}" == "upstream-pre-request-auth" ]]; then
+          if [[ "${{ matrix.mlflow-version }}" == "upstream-scale-testing" ]]; then
             uv pip install --no-deps -e .
             uv pip install \
-              "mlflow @ https://github.com/mlflow/mlflow/archive/aebec5c03a3cc8e97f2dd0ba30217ef946e1c218.tar.gz" \
+              "mlflow @ https://github.com/mlflow/mlflow/archive/34c75beb57e0cecf3556df2ebc5f29689cf2e15c.tar.gz" \
               kubernetes \
-              graphql-core \
+              "graphql-core>=3.2.0,<3.3" \
               httpx \
               pytest \
               pytest-mock \
@@ -134,11 +133,10 @@ jobs:
       fail-fast: false
       matrix:
         # Keep quoted so YAML does not coerce 3.10 to 3.1.
-        mlflow-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        mlflow-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15", "3.16"]
         include:
-          # Temporary baseline. Once request-side collection scoping lands, rebase on MLflow 3.17
-          # and replace this entry with "3.17".
-          - mlflow-version: "upstream-pre-request-auth"
+          # Pin the upstream source used by the OpenShift scale-testing image.
+          - mlflow-version: "upstream-scale-testing"
     env:
       _MLFLOW_STATIC_PREFIX: /mlflow
       UV_RUN: uv run --no-sync
@@ -152,12 +150,12 @@ jobs:
       - name: Install dependencies
         run: |
           uv venv
-          if [[ "${{ matrix.mlflow-version }}" == "upstream-pre-request-auth" ]]; then
+          if [[ "${{ matrix.mlflow-version }}" == "upstream-scale-testing" ]]; then
             uv pip install --no-deps -e .
             uv pip install \
-              "mlflow @ https://github.com/mlflow/mlflow/archive/aebec5c03a3cc8e97f2dd0ba30217ef946e1c218.tar.gz" \
+              "mlflow @ https://github.com/mlflow/mlflow/archive/34c75beb57e0cecf3556df2ebc5f29689cf2e15c.tar.gz" \
               kubernetes \
-              graphql-core \
+              "graphql-core>=3.2.0,<3.3" \
               httpx \
               pytest \
               pytest-mock

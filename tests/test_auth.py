@@ -70,6 +70,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_13_AUTH_SURFACE,
     HAS_MLFLOW_3_14_AUTH_SURFACE,
     HAS_MLFLOW_3_15_AUTH_SURFACE,
+    HAS_MLFLOW_3_16_AUTH_SURFACE,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
     BatchGetTraceInfos,
@@ -123,6 +124,7 @@ from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
     COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+    COLLECTION_POLICY_RESPONSE_GATEWAY_MODELS,
     COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
     COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
     COLLECTION_POLICY_RESPONSE_SCORERS,
@@ -339,6 +341,10 @@ def test_canonicalize_path_static_prefix_applies_to_supported_route_families(mon
     assert _canonicalize_path(raw_path=health_path) == "/health"
     assert _canonicalize_path(raw_path=metrics_path) == "/metrics"
     assert _canonicalize_path(raw_path=version_path) == "/version"
+    assert _canonicalize_path(raw_path="/mlflow/gateway/mlflow/v1/models") == (
+        "/gateway/mlflow/v1/models"
+    )
+    assert _canonicalize_path(raw_path="/mlflow/v1/traces") == "/v1/traces"
 
 
 @pytest.mark.parametrize(
@@ -3403,6 +3409,28 @@ def test_mlflow_315_request_authorization_rules_cover_new_endpoints():
         assert PATH_AUTHORIZATION_RULES[(prefix, "PUT")] == artifact_put_rule
 
 
+def test_mlflow_316_path_authorization_rules_cover_new_endpoints():
+    if not HAS_MLFLOW_3_16_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.16 auth surface.")
+
+    assert PATH_AUTHORIZATION_RULES[("/gateway/mlflow/v1/models", "GET")] == AuthorizationRule(
+        "get",
+        resource=RESOURCE_GATEWAY_ENDPOINTS,
+        collection_policy=COLLECTION_POLICY_RESPONSE_GATEWAY_MODELS,
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/gateway/typesafe/v1/systemone", "POST")
+    ] == AuthorizationRule(
+        "create",
+        resource=RESOURCE_GATEWAY_ENDPOINTS,
+        subresource="use",
+        resource_name_parsers=(RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
+    )
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/assistant/sessions/<session_id>/tool-result", "POST")
+    ] == AuthorizationRule("update", resource=RESOURCE_ASSISTANTS)
+
+
 def test_mlflow_prefixed_custom_path_authorization_rules_are_registered():
     get_job_rule = PATH_AUTHORIZATION_RULES[("/ajax-api/3.0/mlflow/jobs/<job_id>", "GET")]
     cancel_job_rule = PATH_AUTHORIZATION_RULES[
@@ -4392,6 +4420,37 @@ def test_apply_response_collection_filters_filters_experiments():
     assert filtered == {"experiments": [{"experiment_id": "1", "name": "exp-a"}]}
 
 
+@pytest.mark.parametrize(
+    "data, expected, enforceable",
+    [
+        ([{"id": "visible"}, {"id": "hidden"}, {}, None], [{"id": "visible"}], True),
+        ([], [], True),
+        (None, None, False),
+        ({"id": "visible"}, {"id": "visible"}, False),
+    ],
+)
+def test_gateway_model_collection_filter_fails_closed(data, expected, enforceable):
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "visible"
+    )
+    filtered, actual_enforceable = apply_response_collection_filters(
+        {"object": "list", "data": data},
+        [
+            AuthorizationRule(
+                "get",
+                resource=RESOURCE_GATEWAY_ENDPOINTS,
+                collection_policy=COLLECTION_POLICY_RESPONSE_GATEWAY_MODELS,
+            )
+        ],
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert actual_enforceable is enforceable
+    assert filtered == {"object": "list", "data": expected}
+
+
 def test_apply_response_collection_filters_filters_mcp_servers():
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
@@ -5150,6 +5209,8 @@ def test_gateway_proxy_post_routes_use_endpoint_name_parser():
         routes.append(("/gateway/proxy/<endpoint_name>/<path:path>", "POST"))
     if HAS_MLFLOW_3_14_AUTH_SURFACE:
         routes.append(("/gateway/openai/v1/responses/compact", "POST"))
+    if HAS_MLFLOW_3_16_AUTH_SURFACE:
+        routes.append(("/gateway/typesafe/v1/systemone", "POST"))
 
     for route in routes:
         rule = PATH_AUTHORIZATION_RULES[route]
