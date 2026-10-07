@@ -18,8 +18,8 @@ from mlflow_kubernetes_plugins.auth._compat import (
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_BROAD_ONLY,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
-    COLLECTION_POLICY_RESPONSE_TRACES,
 )
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,
@@ -50,11 +50,11 @@ def apply_v3_11_deltas(
         tuple[str, str], AuthorizationRule | tuple[AuthorizationRule, ...]
     ],
 ) -> None:
-    request_authorization_rules.update(
+    request_authorization_rules.update(  # ty: ignore[no-matching-overload]
         {
             BatchGetTraceInfos: _experiments_rule(
                 "list",
-                collection_policy=COLLECTION_POLICY_RESPONSE_TRACES,
+                collection_policy=COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
             ),
             GetPresignedDownloadUrl: _experiments_rule(
                 "get",

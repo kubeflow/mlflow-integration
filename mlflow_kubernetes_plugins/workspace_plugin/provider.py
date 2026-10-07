@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from kubernetes import client, config
 from kubernetes.client import CoreV1Api, CustomObjectsApi
 from kubernetes.config.config_exception import ConfigException
-from mlflow.entities.workspace import Workspace
+from mlflow.entities.workspace import Workspace, WorkspaceDeletionMode
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.protos.databricks_pb2 import (
@@ -171,7 +171,9 @@ class KubernetesWorkspaceProvider(AbstractStore):
     def update_workspace(self, workspace: Workspace) -> Workspace:  # type: ignore[override]
         raise NotImplementedError("Namespace updates are not supported by this provider")
 
-    def delete_workspace(self, workspace_name: str) -> None:  # type: ignore[override]
+    def delete_workspace(
+        self, workspace_name: str, mode: WorkspaceDeletionMode = WorkspaceDeletionMode.RESTRICT
+    ) -> None:
         raise NotImplementedError("Namespace deletion is not supported by this provider")
 
     def get_default_workspace(self) -> Workspace:  # type: ignore[override]
@@ -381,9 +383,11 @@ def create_kubernetes_workspace_store(workspace_uri: str, **_kwargs) -> Kubernet
     """
 
     options = _parse_workspace_uri_options(workspace_uri)
+    label_selector = options.get("label_selector")
+    default_workspace = options.get("default_workspace")
     return KubernetesWorkspaceProvider(
         tracking_uri=workspace_uri,
-        label_selector=options.get("label_selector"),
-        default_workspace=options.get("default_workspace"),
+        label_selector=label_selector if isinstance(label_selector, str) else None,
+        default_workspace=default_workspace if isinstance(default_workspace, str) else None,
         namespace_exclude_globs=options.get("namespace_exclude_globs"),
     )

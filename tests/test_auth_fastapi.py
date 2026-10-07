@@ -21,13 +21,21 @@ from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
 from mlflow_kubernetes_plugins.auth._compat import HAS_MCP_REGISTRY
 from mlflow_kubernetes_plugins.auth.authorizer import (
     AuthorizationMode,
+    CollectionScope,
     KubernetesAuthConfig,
     KubernetesAuthorizer,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
-    COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
 )
 from mlflow_kubernetes_plugins.auth.compiler import _validate_fastapi_route_authorization
 from mlflow_kubernetes_plugins.auth.constants import (
@@ -101,14 +109,14 @@ def test_mcp_registry_endpoints_in_auth_rules():
             "GET",
             "list",
             (),
-            COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+            COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
         ),
         (
             "/api/3.0/mlflow/mcp-servers/endpoints",
             "GET",
             "list",
             (),
-            COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+            COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
         ),
         (
             "/api/3.0/mlflow/mcp-servers/<path:name>",
@@ -874,7 +882,7 @@ def test_mounted_flask_path_params_enable_resource_name_fallback(
     assert second_call.kwargs == {"resource_name": "exp-for-model-123"}
 
 
-def test_fastapi_response_collection_filter_applies_to_experiments(
+def test_fastapi_search_scopes_named_get_before_dispatch(
     mock_authorizer, mock_config, monkeypatch
 ) -> None:
     app = FastAPI()
@@ -894,13 +902,8 @@ def test_fastapi_response_collection_filter_applies_to_experiments(
                 workspace_context.clear_server_request_workspace()
 
     @app.get("/api/2.0/mlflow/experiments/search")
-    async def search_experiments(_request: Request):
-        return {
-            "experiments": [
-                {"experiment_id": "1", "name": "exp-a"},
-                {"experiment_id": "2", "name": "exp-b"},
-            ]
-        }
+    async def search_experiments(request: Request):
+        return {"filter": request.query_params.get("filter")}
 
     app.add_middleware(
         KubernetesAuthMiddleware,
@@ -909,16 +912,15 @@ def test_fastapi_response_collection_filter_applies_to_experiments(
     )
     app.add_middleware(_WorkspaceContextMiddleware)
 
-    mock_authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "exp-a"
-    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
     monkeypatch.setattr(
         "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
         lambda path, method, **kwargs: [
             AuthorizationRule(
                 "list",
                 resource="experiments",
-                collection_policy=COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+                collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
             )
         ],
     )
@@ -931,9 +933,18 @@ def test_fastapi_response_collection_filter_applies_to_experiments(
                 WORKSPACE_HEADER_NAME: "team-a",
             },
         )
+        mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+        denied = client.get(
+            "/api/2.0/mlflow/experiments/search",
+            headers={
+                "Authorization": "Bearer valid-token",
+                WORKSPACE_HEADER_NAME: "team-a",
+            },
+        )
 
     assert response.status_code == 200
-    assert response.json()["experiments"] == [{"experiment_id": "1", "name": "exp-a"}]
+    assert response.json() == {"filter": "name = 'exp-a'"}
+    assert denied.status_code == 403
 
 
 def test_fastapi_filters_mounted_flask_workspace_lists(
@@ -1042,6 +1053,490 @@ def test_fastapi_rewrites_experiment_id_sources_for_mounted_flask_app(
     assert response.status_code == 200
     assert response.json()["json_body"] == {"experiment_ids": ["body-allowed"]}
     assert response.json()["query_ids"] == []
+
+
+def test_fastapi_search_traces_scopes_before_handler(mock_authorizer, mock_config, monkeypatch):
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.get("/api/2.0/mlflow/traces/search")
+    def search_traces():
+        ids = flask_request.args.getlist("experiment_ids")
+        handler(ids)
+        return {"experiment_ids": ids}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule(
+                "list",
+                resource="experiments",
+                collection_policy=COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1",),
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+
+    client = TestClient(app)
+    response = client.get(
+        "/api/2.0/mlflow/traces/search",
+        params={"experiment_ids": ["1", "2"]},
+        headers={"Authorization": "Bearer token"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"experiment_ids": ["1"]}
+    handler.assert_called_once_with(["1"])
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.get("/api/2.0/mlflow/traces/search", headers={"Authorization": "Bearer token"})
+    assert denied.status_code == 403
+    handler.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "policy"),
+    [
+        (
+            "/api/3.0/mlflow/traces/batchGet",
+            "GET",
+            COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+        ),
+        (
+            "/api/3.0/mlflow/traces/batchGetInfos",
+            "POST",
+            COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+        ),
+    ],
+)
+def test_fastapi_batch_trace_scope_reaches_handler(
+    mock_authorizer, mock_config, monkeypatch, path, method, policy
+):
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.route(path, methods=[method])
+    def batch_get_traces():
+        ids = (
+            flask_request.get_json()["experiment_ids"]
+            if method == "POST"
+            else flask_request.args.getlist("experiment_ids")
+        )
+        trace_ids = (
+            flask_request.get_json()["trace_ids"]
+            if method == "POST"
+            else flask_request.args.getlist("trace_ids")
+        )
+        handler(ids, trace_ids)
+        return {"experiment_ids": ids, "trace_ids": trace_ids}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule("list", resource="experiments", collection_policy=policy)
+        ],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._batch_trace_scope_supported",
+        lambda *, infos: True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1",),
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    client = TestClient(app)
+    request_kwargs = (
+        {"json": {"trace_ids": ["trace-a", "trace-b"]}}
+        if method == "POST"
+        else {"params": {"trace_ids": ["trace-a", "trace-b"]}}
+    )
+    response = client.request(
+        method, path, headers={"Authorization": "Bearer token"}, **request_kwargs
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "experiment_ids": ["1"],
+        "trace_ids": ["trace-a", "trace-b"],
+    }
+    handler.assert_called_once_with(["1"], ["trace-a", "trace-b"])
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.request(
+        method, path, headers={"Authorization": "Bearer token"}, **request_kwargs
+    )
+    assert denied.status_code == 403
+    handler.assert_called_once()
+
+
+def test_fastapi_list_scorers_single_and_cross_experiment_scope(
+    mock_authorizer, mock_config, monkeypatch
+):
+    from mlflow.protos.service_pb2 import ListScorers
+
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.get("/api/3.0/mlflow/scorers/list")
+    def list_scorers():
+        singular = flask_request.args.get("experiment_id")
+        plural = flask_request.args.getlist("experiment_ids")
+        handler(singular, plural)
+        return {"experiment_id": singular, "experiment_ids": plural}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule(
+                "list",
+                resource="experiments",
+                collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: "exp-a",
+    )
+    mock_authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        args[2] == "get" and kwargs.get("resource_name") == "exp-a"
+    )
+    client = TestClient(app)
+
+    single = client.get(
+        "/api/3.0/mlflow/scorers/list",
+        params={"experiment_id": "1"},
+        headers={"Authorization": "Bearer token"},
+    )
+    assert single.status_code == 200
+    assert single.json() == {"experiment_id": "1", "experiment_ids": []}
+    handler.assert_called_once_with("1", [])
+
+    monkeypatch.setattr(
+        ListScorers,
+        "DESCRIPTOR",
+        SimpleNamespace(fields_by_name={"experiment_ids": object()}),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(
+        names=("exp-a", "exp-b")
+    )
+    cross = client.get(
+        "/api/3.0/mlflow/scorers/list",
+        headers={"Authorization": "Bearer token"},
+    )
+    assert cross.status_code == 200
+    assert cross.json() == {"experiment_id": None, "experiment_ids": ["1", "2"]}
+    assert handler.call_count == 2
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.get("/api/3.0/mlflow/scorers/list", headers={"Authorization": "Bearer token"})
+    assert denied.status_code == 403
+    assert handler.call_count == 2
+
+
+def test_fastapi_search_experiments_scopes_before_handler(
+    mock_authorizer, mock_config, monkeypatch
+):
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.route("/api/2.0/mlflow/experiments/search", methods=["GET", "POST"])
+    def search_experiments():
+        actual_filter = (
+            flask_request.get_json()["filter"]
+            if flask_request.method == "POST"
+            else flask_request.args["filter"]
+        )
+        handler(actual_filter)
+        return {"filter": actual_filter}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule(
+                "list",
+                resource="experiments",
+                collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+            )
+        ],
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    client = TestClient(app)
+
+    get_response = client.get(
+        "/api/2.0/mlflow/experiments/search",
+        params={"filter": "name ILIKE 'exp%'"},
+        headers={"Authorization": "Bearer token"},
+    )
+    assert get_response.status_code == 200
+    assert get_response.json() == {"filter": "name ILIKE 'exp%' AND name = 'exp-a'"}
+
+    post_response = client.post(
+        "/api/2.0/mlflow/experiments/search",
+        json={"filter": "name ILIKE 'exp%'"},
+        headers={"Authorization": "Bearer token"},
+    )
+    assert post_response.status_code == 200
+    assert post_response.json() == {"filter": "name ILIKE 'exp%' AND name = 'exp-a'"}
+    assert handler.call_count == 2
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.get(
+        "/api/2.0/mlflow/experiments/search", headers={"Authorization": "Bearer token"}
+    )
+    assert denied.status_code == 403
+    assert handler.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("path", "policy"),
+    [
+        (
+            "/api/2.0/mlflow/registered-models/search",
+            COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+        ),
+        (
+            "/ajax-api/2.0/mlflow/model-versions/search",
+            COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+        ),
+    ],
+)
+def test_fastapi_model_search_scopes_before_handler(
+    mock_authorizer, mock_config, monkeypatch, path, policy
+):
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.get(path)
+    def search_models():
+        actual_filter = flask_request.args["filter"]
+        handler(actual_filter)
+        return {"filter": actual_filter}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule("list", resource="registeredmodels", collection_policy=policy)
+        ],
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    client = TestClient(app)
+
+    response = client.get(
+        path,
+        params={"filter": "name ILIKE 'model%'"},
+        headers={"Authorization": "Bearer token"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"filter": "name ILIKE 'model%' AND name = 'model-a'"}
+    handler.assert_called_once_with("name ILIKE 'model%' AND name = 'model-a'")
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.get(path, headers={"Authorization": "Bearer token"})
+    assert denied.status_code == 403
+    handler.assert_called_once()
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_fastapi_dataset_search_scopes_before_handler(
+    mock_authorizer, mock_config, monkeypatch, method
+):
+    flask_app = Flask(__name__)
+    app = FastAPI()
+    handler = Mock()
+
+    @flask_app.route("/api/3.0/mlflow/datasets/search", methods=["GET", "POST"])
+    def search_datasets():
+        params = flask_request.get_json() if method == "POST" else flask_request.args
+        actual_filter = params["filter_string"]
+        handler(actual_filter)
+        return {"filter_string": actual_filter}
+
+    app.mount("/", WSGIMiddleware(flask_app))
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule(
+                "list",
+                resource="datasets",
+                collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+            )
+        ],
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(names=("dataset-a",))
+    client = TestClient(app)
+    payload = {"filter_string": "created_by = 'user-a'"}
+    request_kwargs = {"json": payload} if method == "POST" else {"params": payload}
+
+    response = client.request(
+        method,
+        "/api/3.0/mlflow/datasets/search",
+        headers={"Authorization": "Bearer token"},
+        **request_kwargs,
+    )
+    assert response.status_code == 200
+    assert response.json() == {"filter_string": "created_by = 'user-a' AND name = 'dataset-a'"}
+    handler.assert_called_once()
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.request(
+        method,
+        "/api/3.0/mlflow/datasets/search",
+        headers={"Authorization": "Bearer token"},
+        **request_kwargs,
+    )
+    assert denied.status_code == 403
+    handler.assert_called_once()
+
+
+def test_fastapi_mcp_search_scopes_before_handler(mock_authorizer, mock_config, monkeypatch):
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    path = "/api/3.0/mlflow/mcp-servers"
+    policy = COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS
+    scope_filter = "name = 'team/server-a'"
+    app = FastAPI()
+    handler = Mock()
+
+    @app.get(path)
+    async def search_mcp(filter_string: str | None = None):
+        handler(filter_string)
+        return {"filter_string": filter_string}
+
+    class _WorkspaceContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            workspace_context.set_server_request_workspace("team-a")
+            try:
+                return await call_next(request)
+            finally:
+                workspace_context.clear_server_request_workspace()
+
+    app.add_middleware(
+        KubernetesAuthMiddleware, authorizer=mock_authorizer, config_values=mock_config
+    )
+    app.add_middleware(_WorkspaceContextMiddleware)
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [
+            AuthorizationRule("list", resource="mcpservers", collection_policy=policy)
+        ],
+    )
+    mock_authorizer.is_allowed.return_value = False
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope(
+        names=("team/server-a",)
+    )
+    client = TestClient(app)
+
+    response = client.get(path, headers={"Authorization": "Bearer token"})
+    assert response.status_code == 200
+    assert response.json() == {"filter_string": scope_filter}
+    handler.assert_called_once_with(scope_filter)
+
+    mock_authorizer.discover_collection_scope.return_value = CollectionScope()
+    denied = client.get(path, headers={"Authorization": "Bearer token"})
+    assert denied.status_code == 403
+    handler.assert_called_once()
 
 
 def test_fastapi_rewrites_native_query_params_and_clears_request_cache(

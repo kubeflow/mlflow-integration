@@ -23,6 +23,7 @@ from mlflow.protos.model_registry_pb2 import (
     GetModelVersion,
     GetRegisteredModel,
     RenameRegisteredModel,
+    SearchRegisteredModels,
 )
 from mlflow.protos.service_pb2 import (
     AddDatasetToExperiments,
@@ -54,7 +55,10 @@ from mlflow.protos.service_pb2 import (
     ListScorers,
     ListWorkspaces,
     RemoveDatasetFromExperiments,
+    SearchEvaluationDatasets,
+    SearchExperiments,
     SearchPromptOptimizationJobs,
+    SearchTraces,
     SetDatasetTags,
     SetGatewayEndpointTag,
     StartTraceV3,
@@ -112,23 +116,29 @@ from mlflow_kubernetes_plugins.auth._compat import (
 )
 from mlflow_kubernetes_plugins.auth.authorizer import (
     AuthorizationMode,
+    CollectionScope,
     KubernetesAuthConfig,
     KubernetesAuthorizer,
     _AuthorizationCache,
     _AuthorizationCacheKey,
-    _CacheEntry,
+    _ImpersonatingApiClient,
+    _RulesReviewCache,
 )
 from mlflow_kubernetes_plugins.auth.collection_filters import (
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
-    COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
-    COLLECTION_POLICY_RESPONSE_SCORERS,
-    COLLECTION_POLICY_RESPONSE_TRACES,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     apply_request_collection_filter,
-    apply_response_collection_filters,
 )
 from mlflow_kubernetes_plugins.auth.compiler import (
     _compile_named_path_pattern,
@@ -189,6 +199,7 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     ResourceNameResolutionError,
     _NameLookupCache,
     apply_response_cache_updates,
+    resolve_experiment_ids_from_names,
     resolve_resource_names,
 )
 from mlflow_kubernetes_plugins.auth.rules import (
@@ -624,7 +635,10 @@ def test_get_workspace_is_denied_when_workspaces_are_disabled(monkeypatch):
 
 
 def test_graphql_middleware_uses_resolved_authorization_workspace():
-    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer=Mock())
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer=authorizer)
     info = SimpleNamespace(field_name="mlflowSearchModelVersions")
     auth_result = _AuthorizationResult(
         identity=_RequestIdentity(token="graphql-token"),
@@ -643,16 +657,17 @@ def test_graphql_middleware_uses_resolved_authorization_workspace():
 
     token = _AUTHORIZATION_HANDLED.set(auth_result)
     try:
-        with patch(
-            "mlflow_kubernetes_plugins.auth.graphql.filter_graphql_model_versions_result",
-            return_value={"filtered": True},
-        ) as mock_filter:
-            result = middleware.resolve(lambda root, info, **args: {"raw": True}, None, info)
+        result = middleware.resolve(
+            lambda root, info, **args: {"filter": args["input"]["filter"]},
+            None,
+            info,
+            input={"filter": ""},
+        )
     finally:
         _AUTHORIZATION_HANDLED.reset(token)
 
-    assert result == {"filtered": True}
-    assert mock_filter.call_args.kwargs["workspace_name"] == "team-a"
+    assert result == {"filter": "name = 'model-a'"}
+    assert authorizer.discover_collection_scope.call_args.args[2] == "team-a"
 
 
 def _build_workspace_app(monkeypatch):
@@ -2572,7 +2587,7 @@ def test_authorize_request_denies_targeted_list_scorers_without_experiment_acces
         "get",
         resource=RESOURCE_EXPERIMENTS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        collection_policy="legacy_scorer_policy",
         fallback_to_collection_policy_on_missing_resource_reference=True,
     )
     monkeypatch.setattr(
@@ -2618,7 +2633,7 @@ def test_authorize_request_uses_targeted_experiment_access_for_list_scorers(monk
         "get",
         resource=RESOURCE_EXPERIMENTS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        collection_policy="legacy_scorer_policy",
         fallback_to_collection_policy_on_missing_resource_reference=True,
     )
     monkeypatch.setattr(
@@ -2634,7 +2649,7 @@ def test_authorize_request_uses_targeted_experiment_access_for_list_scorers(monk
         lambda experiment_id: "exp-a",
     )
 
-    result = _authorize_request(
+    _authorize_request(
         AuthorizationRequest(
             authorization_header="Bearer scorer-token",
             forwarded_access_token=None,
@@ -2649,12 +2664,11 @@ def test_authorize_request_uses_targeted_experiment_access_for_list_scorers(monk
         config_values=KubernetesAuthConfig(),
     )
 
-    assert result.response_filter_required is False
     second_call = authorizer.is_allowed.call_args_list[1]
     assert second_call.kwargs == {"resource_name": "exp-a"}
 
 
-def test_authorize_request_marks_cross_experiment_list_scorers_for_response_filter(monkeypatch):
+def test_legacy_response_policy_does_not_enable_response_filter(monkeypatch):
     authorizer = Mock()
     authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
         args[1] == RESOURCE_EXPERIMENTS and kwargs.get("resource_name") is None
@@ -2663,7 +2677,7 @@ def test_authorize_request_marks_cross_experiment_list_scorers_for_response_filt
         "get",
         resource=RESOURCE_EXPERIMENTS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        collection_policy="legacy_scorer_policy",
         fallback_to_collection_policy_on_missing_resource_reference=True,
     )
     monkeypatch.setattr(
@@ -2675,7 +2689,7 @@ def test_authorize_request_marks_cross_experiment_list_scorers_for_response_filt
         lambda token, claim: "k8s-user",
     )
 
-    result = _authorize_request(
+    _authorize_request(
         AuthorizationRequest(
             authorization_header="Bearer scorer-token",
             forwarded_access_token=None,
@@ -2689,11 +2703,10 @@ def test_authorize_request_marks_cross_experiment_list_scorers_for_response_filt
         config_values=KubernetesAuthConfig(),
     )
 
-    assert result.response_filter_required is True
     assert authorizer.is_allowed.call_count == 1
 
 
-def test_authorize_request_treats_blank_experiment_id_as_cross_experiment_list_for_scorers(
+def test_legacy_response_policy_denies_blank_experiment_id_without_permission(
     monkeypatch,
 ):
     authorizer = Mock()
@@ -2702,7 +2715,7 @@ def test_authorize_request_treats_blank_experiment_id_as_cross_experiment_list_f
         "get",
         resource=RESOURCE_EXPERIMENTS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        collection_policy="legacy_scorer_policy",
         fallback_to_collection_policy_on_missing_resource_reference=True,
     )
     monkeypatch.setattr(
@@ -2714,22 +2727,21 @@ def test_authorize_request_treats_blank_experiment_id_as_cross_experiment_list_f
         lambda token, claim: "k8s-user",
     )
 
-    result = _authorize_request(
-        AuthorizationRequest(
-            authorization_header="Bearer scorer-token",
-            forwarded_access_token=None,
-            remote_user_header_value=None,
-            remote_groups_header_value=None,
-            path="/ajax-api/3.0/mlflow/scorers/list",
-            method="GET",
-            workspace="team-a",
-            query_params={"experiment_id": ""},
-        ),
-        authorizer=authorizer,
-        config_values=KubernetesAuthConfig(),
-    )
-
-    assert result.response_filter_required is True
+    with pytest.raises(MlflowException, match="Permission denied"):
+        _authorize_request(
+            AuthorizationRequest(
+                authorization_header="Bearer scorer-token",
+                forwarded_access_token=None,
+                remote_user_header_value=None,
+                remote_groups_header_value=None,
+                path="/ajax-api/3.0/mlflow/scorers/list",
+                method="GET",
+                workspace="team-a",
+                query_params={"experiment_id": ""},
+            ),
+            authorizer=authorizer,
+            config_values=KubernetesAuthConfig(),
+        )
 
 
 def test_authorize_request_rejects_whitespace_only_experiment_id_for_scorers(monkeypatch):
@@ -2739,7 +2751,7 @@ def test_authorize_request_rejects_whitespace_only_experiment_id_for_scorers(mon
         "get",
         resource=RESOURCE_EXPERIMENTS,
         resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
+        collection_policy="legacy_scorer_policy",
         fallback_to_collection_policy_on_missing_resource_reference=True,
     )
     monkeypatch.setattr(
@@ -3188,7 +3200,7 @@ def test_mlflow_311_request_authorization_rules_cover_new_endpoints():
 
     assert (
         REQUEST_AUTHORIZATION_RULES[BatchGetTraceInfos].collection_policy
-        == COLLECTION_POLICY_RESPONSE_TRACES
+        == COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS
     )
     assert REQUEST_AUTHORIZATION_RULES[CreateIssue].resource_name_parsers == (
         RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,
@@ -3297,11 +3309,9 @@ def test_mlflow_313_request_authorization_rules_cover_cross_experiment_list_scor
         pytest.skip("Installed MLflow version does not expose the 3.13 scorer-list behavior.")
 
     assert REQUEST_AUTHORIZATION_RULES[ListScorers] == AuthorizationRule(
-        "get",
+        "list",
         resource=RESOURCE_EXPERIMENTS,
-        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
-        fallback_to_collection_policy_on_missing_resource_reference=True,
+        collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     )
     assert PATH_AUTHORIZATION_RULES[
         ("/ajax-api/3.0/mlflow/assistant/providers/<provider>/models", "GET")
@@ -4092,10 +4102,10 @@ def test_authorization_cache_does_not_drop_new_entries_during_cleanup():
             return None
 
     cache._lock = _InstrumentedLock()  # type: ignore[assignment]
-    cache._entries[key] = _CacheEntry(allowed=True, expires_at=time.time() - 10)
+    cache._entries[key] = (True, time.time() - 10)
 
     def _insert_new_entry():
-        cache._entries[key] = _CacheEntry(allowed=False, expires_at=time.time() + 100)
+        cache._entries[key] = (False, time.time() + 100)
 
     cache._lock.on_release_read = _insert_new_entry  # type: ignore[attr-defined]
 
@@ -4103,6 +4113,1203 @@ def test_authorization_cache_does_not_drop_new_entries_during_cleanup():
     assert cache.get(key) is None
     # New entry should remain available
     assert cache.get(key) is False
+
+
+def test_rules_review_cache_does_not_drop_new_entries_during_cleanup():
+    cache = _RulesReviewCache(ttl_seconds=0.1)
+    key = ("mode", "identity", "namespace")
+
+    class _InstrumentedLock:
+        def __init__(self):
+            self.on_release_read = None
+
+        def acquire_read(self):
+            return None
+
+        def release_read(self):
+            if self.on_release_read:
+                callback = self.on_release_read
+                self.on_release_read = None
+                callback()
+
+        def acquire_write(self):
+            return None
+
+        def release_write(self):
+            return None
+
+    cache._lock = _InstrumentedLock()  # type: ignore[assignment]
+    cache._entries[key] = (("expired-rule",), time.time() - 10)
+
+    def _insert_new_entry():
+        cache._entries[key] = (("fresh-rule",), time.time() + 100)
+
+    cache._lock.on_release_read = _insert_new_entry  # type: ignore[attr-defined]
+
+    assert cache.get(key) is None
+    assert cache.get(key) == ("fresh-rule",)
+
+
+def test_discover_collection_scope_validates_named_grants(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration",
+        lambda: SimpleNamespace(),
+    )
+    authorizer = KubernetesAuthorizer(KubernetesAuthConfig())
+    authorizer._submit_self_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(
+                evaluation_error=None,
+                resource_rules=[
+                    SimpleNamespace(
+                        api_groups=["mlflow.kubeflow.org"],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=[],
+                    ),
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=["exp-a", "exp-b"],
+                    ),
+                ],
+            )
+        )
+    )
+    authorizer.is_allowed = Mock(  # type: ignore[method-assign]
+        side_effect=lambda *args, **kwargs: kwargs.get("resource_name") == "exp-a"
+    )
+
+    scope = authorizer.discover_collection_scope(
+        _RequestIdentity(token="token"), RESOURCE_EXPERIMENTS, "team-a"
+    )
+
+    assert scope == CollectionScope(names=("exp-a",))
+    assert authorizer.is_allowed.call_count == 2
+
+
+def test_discover_collection_scope_ignores_unscoped_get(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration",
+        lambda: SimpleNamespace(),
+    )
+    authorizer = KubernetesAuthorizer(KubernetesAuthConfig())
+    authorizer._submit_self_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(
+                evaluation_error=None,
+                resource_rules=[
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=[],
+                    )
+                ],
+            )
+        )
+    )
+    authorizer.is_allowed = Mock()  # type: ignore[method-assign]
+
+    assert (
+        authorizer.discover_collection_scope(
+            _RequestIdentity(token="token"), RESOURCE_EXPERIMENTS, "team-a"
+        )
+        == CollectionScope()
+    )
+    authorizer.is_allowed.assert_not_called()
+
+
+def test_discover_collection_scope_accepts_explicit_wildcard(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration",
+        lambda: SimpleNamespace(),
+    )
+    authorizer = KubernetesAuthorizer(KubernetesAuthConfig())
+    authorizer._submit_self_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(
+                evaluation_error=None,
+                resource_rules=[
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=["*"],
+                    )
+                ],
+            )
+        )
+    )
+
+    assert authorizer.discover_collection_scope(
+        _RequestIdentity(token="token"), RESOURCE_EXPERIMENTS, "team-a"
+    ) == CollectionScope(broad=True)
+
+
+def test_impersonating_api_client_preserves_multiple_groups(monkeypatch):
+    from kubernetes import client
+
+    captured = {}
+
+    def request(_self, method, url, **kwargs):
+        captured.update(method=method, url=url, headers=kwargs["headers"])
+        return None
+
+    monkeypatch.setattr(client.ApiClient, "request", request)
+    api_client = _ImpersonatingApiClient(client.Configuration(), ("team-a", "team-b"))
+    try:
+        api_client.request("POST", "/rules", headers={"Impersonate-User": "alice"})
+    finally:
+        api_client.close()
+
+    assert captured["headers"].getlist("Impersonate-Group") == ["team-a", "team-b"]
+    assert captured["headers"]["Impersonate-User"] == "alice"
+
+
+def test_discover_collection_scope_in_sar_mode_uses_forwarded_identity(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._create_api_client_for_subject_access_reviews",
+        lambda: Mock(configuration=Mock()),
+    )
+    authorizer = KubernetesAuthorizer(
+        KubernetesAuthConfig(authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW)
+    )
+    authorizer._submit_impersonated_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(
+                evaluation_error=None,
+                incomplete=False,
+                resource_rules=[
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=["exp-a"],
+                    )
+                ],
+            )
+        )
+    )
+    authorizer.is_allowed = Mock(return_value=True)  # type: ignore[method-assign]
+    identity = _RequestIdentity(user="alice", groups=("team-a", "team-b"))
+
+    assert authorizer.discover_collection_scope(
+        identity, RESOURCE_EXPERIMENTS, "team-a"
+    ) == CollectionScope(names=("exp-a",))
+    authorizer._submit_impersonated_subject_rules_review.assert_called_once_with(
+        "alice", ("team-a", "team-b"), "team-a"
+    )
+    authorizer.is_allowed.assert_called_once_with(
+        identity, RESOURCE_EXPERIMENTS, "get", "team-a", None, resource_name="exp-a"
+    )
+
+
+def test_discover_collection_scope_in_sar_mode_denies_without_impersonation(monkeypatch):
+    from kubernetes.client.exceptions import ApiException
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._create_api_client_for_subject_access_reviews",
+        lambda: Mock(configuration=Mock()),
+    )
+    authorizer = KubernetesAuthorizer(
+        KubernetesAuthConfig(authorization_mode=AuthorizationMode.SUBJECT_ACCESS_REVIEW)
+    )
+    authorizer._submit_impersonated_subject_rules_review = Mock(  # type: ignore[method-assign]
+        side_effect=ApiException(status=403)
+    )
+    authorizer.is_allowed = Mock()  # type: ignore[method-assign]
+
+    with pytest.raises(MlflowException, match="Failed to discover"):
+        authorizer.discover_collection_scope(
+            _RequestIdentity(user="alice", groups=("team-a",)),
+            RESOURCE_EXPERIMENTS,
+            "team-a",
+        )
+    authorizer.is_allowed.assert_not_called()
+
+
+def test_discover_collection_scope_rejects_incomplete_rules(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration",
+        lambda: SimpleNamespace(),
+    )
+    authorizer = KubernetesAuthorizer(KubernetesAuthConfig())
+    authorizer._submit_self_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(evaluation_error=None, incomplete=True, resource_rules=[])
+        )
+    )
+
+    with pytest.raises(MlflowException, match="could not be evaluated"):
+        authorizer.discover_collection_scope(
+            _RequestIdentity(token="token"), RESOURCE_EXPERIMENTS, "team-a"
+        )
+
+
+def test_discover_collection_scope_reuses_complete_rules_per_caller_and_namespace(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.authorizer._load_kubernetes_configuration",
+        lambda: SimpleNamespace(),
+    )
+    authorizer = KubernetesAuthorizer(KubernetesAuthConfig(cache_ttl_seconds=60))
+    authorizer._submit_self_subject_rules_review = Mock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            status=SimpleNamespace(
+                evaluation_error=None,
+                incomplete=False,
+                resource_rules=[
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["experiments"],
+                        verbs=["get"],
+                        resource_names=["exp-a"],
+                    ),
+                    SimpleNamespace(
+                        api_groups=[authorizer._group],
+                        resources=["datasets"],
+                        verbs=["get"],
+                        resource_names=["dataset-a"],
+                    ),
+                ],
+            )
+        )
+    )
+    authorizer.is_allowed = Mock(return_value=True)  # type: ignore[method-assign]
+    identity = _RequestIdentity(token="token")
+
+    assert authorizer.discover_collection_scope(
+        identity, RESOURCE_EXPERIMENTS, "team-a"
+    ) == CollectionScope(names=("exp-a",))
+    assert authorizer.discover_collection_scope(
+        identity, RESOURCE_DATASETS, "team-a"
+    ) == CollectionScope(names=("dataset-a",))
+    authorizer._submit_self_subject_rules_review.assert_called_once_with("token", "team-a")
+    assert authorizer.is_allowed.call_count == 2
+
+
+def test_authorize_search_traces_scopes_request_before_response(monkeypatch):
+    assert (
+        REQUEST_AUTHORIZATION_RULES[SearchTraces].collection_policy
+        == COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [REQUEST_AUTHORIZATION_RULES[SearchTraces]],
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1",),
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    context = AuthorizationRequest(
+        authorization_header="Bearer token",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/traces/search",
+        method="GET",
+        workspace="team-a",
+        query_params={"experiment_ids": ["1", "2"]},
+    )
+
+    result = _authorize_request(
+        context, authorizer=authorizer, config_values=KubernetesAuthConfig()
+    )
+    assert result.request_context.query_params["experiment_ids"] == ["1"]
+
+
+def test_authorize_search_traces_denies_without_named_scope(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.compiler._find_authorization_rules",
+        lambda path, method, **kwargs: [REQUEST_AUTHORIZATION_RULES[SearchTraces]],
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope()
+    context = AuthorizationRequest(
+        authorization_header="Bearer token",
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/traces/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    with pytest.raises(MlflowException, match="Permission denied"):
+        _authorize_request(context, authorizer=authorizer, config_values=KubernetesAuthConfig())
+
+
+@pytest.mark.parametrize(
+    ("body_ids", "query_ids", "expected"),
+    [
+        (["1", "2"], ["2"], ["2"]),
+        (["1"], ["2"], None),
+        ([], ["1"], None),
+    ],
+)
+def test_search_traces_scope_intersects_body_and_query(monkeypatch, body_ids, query_ids, expected):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a", "b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/traces/search",
+        method="GET",
+        workspace="team-a",
+        json_body={"experimentIds": body_ids},
+        query_params={"experiment_ids": query_ids},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is (expected is not None)
+    if expected is not None:
+        assert updated.json_body == {"experiment_ids": expected}
+        assert updated.query_params == {"experiment_ids": expected}
+    else:
+        assert updated is context
+
+
+def test_resolve_experiment_ids_from_names_uses_exact_store_lookup(monkeypatch):
+    experiments = {
+        "exp-a": SimpleNamespace(name="exp-a", experiment_id="1"),
+        "exp-b": None,
+    }
+    store = SimpleNamespace(get_experiment_by_name=Mock(side_effect=experiments.get))
+    monkeypatch.setattr(resource_names_mod, "_get_tracking_store", lambda: store)
+
+    assert resolve_experiment_ids_from_names(("exp-a", "exp-b")) == ("1",)
+    assert [call.args[0] for call in store.get_experiment_by_name.call_args_list] == [
+        "exp-a",
+        "exp-b",
+    ]
+
+
+def test_search_experiments_single_name_scopes_before_response():
+    assert (
+        REQUEST_AUTHORIZATION_RULES[SearchExperiments].collection_policy
+        == COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/experiments/search",
+        method="GET",
+        workspace="team-a",
+        query_params={"filter": "name ILIKE 'exp%'", "page_token": "page-2"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {
+        "filter": "name ILIKE 'exp%' AND name = 'exp-a'",
+        "page_token": "page-2",
+    }
+
+
+def test_search_experiments_multiple_names_deny_without_id_in(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._supports_search_experiments_id_in",
+        lambda: False,
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a", "b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/experiments/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is False
+    assert updated is context
+
+
+def test_search_experiments_multiple_names_use_id_in_on_capable_mlflow(monkeypatch):
+    from mlflow.utils.search_utils import SearchExperimentsUtils
+
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("2", "1"),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._supports_search_experiments_id_in",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        SearchExperimentsUtils,
+        "parse_search_filter",
+        lambda filter_string: [
+            {
+                "type": "attribute",
+                "key": "experiment_id",
+                "comparator": "IN",
+                "value": ("1", "2"),
+            }
+        ],
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a", "b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/experiments/search",
+        method="POST",
+        workspace="team-a",
+        json_body={"filter": "name ILIKE 'exp%'", "max_results": 10},
+        query_params={"filter": "creation_time > '100'"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.json_body == {
+        "filter": ("name ILIKE 'exp%' AND creation_time > '100' AND experiment_id IN ('1', '2')"),
+        "max_results": 10,
+    }
+
+
+@pytest.mark.parametrize("caller_filter", ["name = 'a' OR name = 'b'", "name = 'a';"])
+def test_search_experiments_rejects_non_flat_caller_filter(caller_filter):
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/experiments/search",
+        method="GET",
+        workspace="team-a",
+        query_params={"filter": caller_filter},
+    )
+
+    _, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is False
+
+
+@pytest.mark.parametrize(
+    ("policy", "path"),
+    [
+        (
+            COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+            "/api/2.0/mlflow/registered-models/search",
+        ),
+        (
+            COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+            "/api/2.0/mlflow/model-versions/search",
+        ),
+    ],
+)
+def test_model_search_single_name_scopes_query(policy, path):
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path=path,
+        method="GET",
+        workspace="team-a",
+        query_params={"filter": "name ILIKE 'model%'", "page_token": "page-2"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        policy,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {
+        "filter": "name ILIKE 'model%' AND name = 'model-a'",
+        "page_token": "page-2",
+    }
+    authorizer.discover_collection_scope.assert_called_once_with(
+        _RequestIdentity(token="token"), RESOURCE_REGISTERED_MODELS, "team-a"
+    )
+
+
+def test_model_search_rules_scope_named_grants():
+    assert (
+        REQUEST_AUTHORIZATION_RULES[SearchRegisteredModels].collection_policy
+        == COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS
+    )
+    for prefix in ("/api", "/ajax-api"):
+        rule = PATH_AUTHORIZATION_RULES[(f"{prefix}/2.0/mlflow/model-versions/search", "GET")]
+        assert rule.collection_policy == COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS
+
+
+def test_model_search_multiple_names_fail_closed_on_old_parser(monkeypatch):
+    from mlflow.utils.search_utils import SearchModelUtils
+
+    monkeypatch.setattr(
+        SearchModelUtils,
+        "parse_search_filter",
+        Mock(side_effect=MlflowException("IN is unsupported")),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a", "b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/registered-models/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is False
+    assert updated is context
+
+
+@pytest.mark.parametrize(
+    ("policy", "parser_name"),
+    [
+        (COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS, "SearchModelUtils"),
+        (COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS, "SearchModelVersionUtils"),
+    ],
+)
+def test_model_search_multiple_names_emit_name_in_on_capable_mlflow(
+    monkeypatch, policy, parser_name
+):
+    from mlflow.utils import search_utils
+
+    parser = getattr(search_utils, parser_name)
+    monkeypatch.setattr(
+        parser,
+        "parse_search_filter",
+        lambda filter_string: [
+            {
+                "type": "attribute",
+                "key": "name",
+                "comparator": "IN",
+                "value": ("a", "b"),
+            }
+        ],
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("a", "b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/2.0/mlflow/registered-models/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        policy,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params["filter"] == "name IN ('a', 'b')"
+
+
+@pytest.mark.parametrize(
+    ("policy", "method", "body", "query", "expected_body", "expected_query"),
+    [
+        (
+            COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+            "GET",
+            None,
+            {"trace_ids": ["trace-a"], "experiment_ids": ["1", "2"]},
+            None,
+            {"trace_ids": ["trace-a"], "experiment_ids": ["1"]},
+        ),
+        (
+            COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+            "POST",
+            {"trace_ids": ["trace-a"], "experiment_ids": ["1", "2"]},
+            {},
+            {"trace_ids": ["trace-a"], "experiment_ids": ["1"]},
+            {},
+        ),
+    ],
+)
+def test_batch_trace_requests_scope_before_storage(
+    monkeypatch, policy, method, body, query, expected_body, expected_query
+):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._batch_trace_scope_supported",
+        lambda *, infos: True,
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1",),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/traces/batchGet",
+        method=method,
+        workspace="team-a",
+        json_body=body,
+        query_params=query,
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        policy,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.json_body == expected_body
+    assert updated.query_params == expected_query
+
+
+@pytest.mark.parametrize(
+    ("policy", "infos"),
+    [
+        (COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES, False),
+        (COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS, True),
+    ],
+)
+def test_batch_trace_scope_requires_target_proto_field(monkeypatch, policy, infos):
+    assert policy in {
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    }
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._batch_trace_scope_supported",
+        lambda *, infos: False,
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/traces/batchGet",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        policy,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is False
+    assert updated is context
+
+    authorizer.discover_collection_scope.return_value = CollectionScope(broad=True)
+    updated, applied = apply_request_collection_filter(
+        context,
+        policy,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is True
+    assert updated is context
+
+
+def test_list_scorers_rule_supports_named_scope():
+    if not HAS_MLFLOW_3_13_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.13 scorer-list behavior.")
+
+    rule = REQUEST_AUTHORIZATION_RULES[ListScorers]
+    assert rule.verb == "list"
+    assert rule.collection_policy == COLLECTION_POLICY_REQUEST_LIST_SCORERS
+
+
+def test_list_scorers_single_experiment_uses_named_get(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
+        lambda experiment_id: "exp-a",
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") == "exp-a" and args[2] == "get"
+    )
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/scorers/list",
+        method="GET",
+        workspace="team-a",
+        query_params={"experiment_id": "1"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated is context
+    authorizer.discover_collection_scope.assert_not_called()
+    assert authorizer.is_allowed.call_args.kwargs == {"resource_name": "exp-a"}
+
+
+def test_list_scorers_does_not_authorize_camel_case_experiment_id(monkeypatch):
+    from mlflow.protos.service_pb2 import ListScorers as ListScorersProto
+
+    monkeypatch.setattr(
+        ListScorersProto,
+        "DESCRIPTOR",
+        SimpleNamespace(fields_by_name={"experiment_ids": object()}),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a", "exp-b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/scorers/list",
+        method="GET",
+        workspace="team-a",
+        query_params={"experimentId": "1"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {"experimentId": "1", "experiment_ids": ["1", "2"]}
+    authorizer.is_allowed.assert_not_called()
+    authorizer.discover_collection_scope.assert_called_once()
+
+
+def test_list_scorers_does_not_treat_camel_case_experiment_ids_as_a_query_scope(monkeypatch):
+    from mlflow.protos.service_pb2 import ListScorers as ListScorersProto
+
+    monkeypatch.setattr(
+        ListScorersProto,
+        "DESCRIPTOR",
+        SimpleNamespace(fields_by_name={"experiment_ids": object()}),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a", "exp-b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/scorers/list",
+        method="GET",
+        workspace="team-a",
+        query_params={"experimentIds": ["1"]},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {"experimentIds": ["1"], "experiment_ids": ["1", "2"]}
+
+
+def test_list_scorers_cross_experiment_injects_ids(monkeypatch):
+    from mlflow.protos.service_pb2 import ListScorers as ListScorersProto
+
+    # Simulate the target protobuf without changing the installed 3.15.2 package.
+    monkeypatch.setattr(
+        ListScorersProto,
+        "DESCRIPTOR",
+        SimpleNamespace(fields_by_name={"experiment_ids": object()}),
+    )
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.auth.collection_filters.resolve_experiment_ids_from_names",
+        lambda names: ("1", "2"),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("exp-a", "exp-b"))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/scorers/list",
+        method="GET",
+        workspace="team-a",
+        query_params={"experiment_ids": ["2", "3"]},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {"experiment_ids": ["2"]}
+
+
+def test_list_scorers_rejects_mixed_experiment_selectors():
+    authorizer = Mock()
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/scorers/list",
+        method="GET",
+        workspace="team-a",
+        query_params={"experiment_id": "1", "experiment_ids": ["2"]},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is False
+    assert updated is context
+    authorizer.discover_collection_scope.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_search_evaluation_datasets_scopes_by_dataset_name(method):
+    assert (
+        REQUEST_AUTHORIZATION_RULES[SearchEvaluationDatasets].collection_policy
+        == COLLECTION_POLICY_REQUEST_SEARCH_DATASETS
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("dataset-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/datasets/search",
+        method=method,
+        workspace="team-a",
+        json_body={"filter_string": "created_by = 'user-a'", "experiment_ids": ["1"]}
+        if method == "POST"
+        else None,
+        query_params={"filter_string": "created_by = 'user-a'", "experiment_ids": ["1"]}
+        if method == "GET"
+        else {},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    params = updated.json_body if method == "POST" else updated.query_params
+    assert params == {
+        "filter_string": "created_by = 'user-a' AND name = 'dataset-a'",
+        "experiment_ids": ["1"],
+    }
+    authorizer.discover_collection_scope.assert_called_once_with(
+        _RequestIdentity(token="token"), RESOURCE_DATASETS, "team-a"
+    )
+
+
+def test_search_evaluation_datasets_multiple_names_require_target_store(monkeypatch):
+    from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
+
+    monkeypatch.setattr(
+        SearchEvaluationDatasetsUtils,
+        "parse_search_filter",
+        Mock(side_effect=MlflowException("Dataset name IN is unsupported")),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(
+        names=("dataset-a", "dataset-b")
+    )
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/datasets/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is False
+    assert updated is context
+
+
+def test_search_evaluation_datasets_multiple_names_emit_name_in_on_target(monkeypatch):
+    from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
+
+    monkeypatch.setattr(
+        SearchEvaluationDatasetsUtils,
+        "parse_search_filter",
+        lambda filter_string: [
+            {
+                "type": "attribute",
+                "key": "name",
+                "comparator": "IN",
+                "value": ("dataset-a", "dataset-b"),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "mlflow.store.tracking.sqlalchemy_store._get_search_datasets_filter_clauses",
+        lambda parsed, dialect: ([object()], []),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(
+        names=("dataset-a", "dataset-b")
+    )
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/datasets/search",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is True
+    assert updated.query_params["filter_string"] == "name IN ('dataset-a', 'dataset-b')"
+
+
+def test_search_mcp_servers_scopes_single_name():
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("team/server-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers",
+        method="GET",
+        workspace="team-a",
+        query_params={"filter_string": "status = 'active'", "page_token": "page-2"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+    assert applied is True
+    assert updated.query_params == {
+        "filter_string": "status = 'active' AND name = 'team/server-a'",
+        "page_token": "page-2",
+    }
+    authorizer.discover_collection_scope.assert_called_once_with(
+        _RequestIdentity(token="token"), RESOURCE_MCP_SERVERS, "team-a"
+    )
+
+
+def test_search_mcp_access_endpoints_scopes_server_names(monkeypatch):
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    from mlflow.utils.search_utils import SearchMCPAccessEndpointUtils
+
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(
+        names=("team/server-a", "team/server-b")
+    )
+    parser = Mock(
+        return_value=[
+            {"type": "attribute", "key": "status", "comparator": "=", "value": "active"},
+            {
+                "type": "attribute",
+                "key": "server_name",
+                "comparator": "IN",
+                "value": ("team/server-a", "team/server-b"),
+            },
+        ]
+    )
+    monkeypatch.setattr(SearchMCPAccessEndpointUtils, "parse_search_filter", parser)
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers/endpoints",
+        method="GET",
+        workspace="team-a",
+        query_params={"filter_string": "status = 'active'", "page_token": "next"},
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is True
+    assert updated.query_params == {
+        "filter_string": (
+            "status = 'active' AND server_name IN ('team/server-a', 'team/server-b')"
+        ),
+        "page_token": "next",
+    }
+    parser.assert_called_once_with(updated.query_params["filter_string"])
+
+
+def test_search_mcp_access_endpoints_denies_unsupported_parser(monkeypatch):
+    if not HAS_MCP_REGISTRY:
+        pytest.skip("Installed MLflow version does not expose the MCP registry routes.")
+
+    from mlflow.utils.search_utils import SearchMCPAccessEndpointUtils
+
+    monkeypatch.setattr(
+        SearchMCPAccessEndpointUtils,
+        "parse_search_filter",
+        Mock(side_effect=MlflowException("server_name IN unsupported")),
+    )
+    authorizer = Mock()
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("team/server-a",))
+    context = AuthorizationRequest(
+        authorization_header=None,
+        forwarded_access_token=None,
+        remote_user_header_value=None,
+        remote_groups_header_value=None,
+        path="/api/3.0/mlflow/mcp-servers/endpoints",
+        method="GET",
+        workspace="team-a",
+    )
+
+    updated, applied = apply_request_collection_filter(
+        context,
+        COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+        authorizer=authorizer,
+        identity=_RequestIdentity(token="token"),
+        workspace_name="team-a",
+    )
+
+    assert applied is False
+    assert updated is context
 
 
 def test_name_lookup_cache_reaps_expired_entries_and_enforces_max_size(monkeypatch):
@@ -4361,202 +5568,6 @@ def test_run_id_cache_uses_stable_experiment_id_after_rename(monkeypatch):
     assert resource_names_mod._resolve_experiment_name_from_run_id("run-123") == "new-name"
     store.get_run.assert_not_called()
     store.get_experiment.assert_not_called()
-
-
-def test_apply_response_collection_filters_filters_experiments():
-    authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "exp-a"
-    )
-
-    filtered, enforceable = apply_response_collection_filters(
-        {
-            "experiments": [
-                {"experiment_id": "1", "name": "exp-a"},
-                {"experiment_id": "2", "name": "exp-b"},
-            ]
-        },
-        [
-            AuthorizationRule(
-                "list",
-                resource=RESOURCE_EXPERIMENTS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
-    assert filtered == {"experiments": [{"experiment_id": "1", "name": "exp-a"}]}
-
-
-def test_apply_response_collection_filters_filters_mcp_servers():
-    authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "com.test/visible"
-    )
-
-    filtered, enforceable = apply_response_collection_filters(
-        {
-            "mcp_servers": [
-                {"name": "com.test/visible"},
-                {"name": "com.test/hidden"},
-            ]
-        },
-        [
-            AuthorizationRule(
-                "list",
-                resource=RESOURCE_MCP_SERVERS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
-    assert filtered == {"mcp_servers": [{"name": "com.test/visible"}]}
-
-
-def test_apply_response_collection_filters_filters_mcp_access_endpoints():
-    authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "com.test/visible"
-    )
-
-    filtered, enforceable = apply_response_collection_filters(
-        {
-            "mcp_access_endpoints": [
-                {"id": "ep-1", "server_name": "com.test/visible"},
-                {"id": "ep-2", "server_name": "com.test/hidden"},
-            ]
-        },
-        [
-            AuthorizationRule(
-                "list",
-                resource=RESOURCE_MCP_SERVERS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
-    assert filtered == {"mcp_access_endpoints": [{"id": "ep-1", "server_name": "com.test/visible"}]}
-
-
-def test_apply_response_collection_filters_filters_scorers(monkeypatch):
-    authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "exp-a"
-    )
-    monkeypatch.setattr(
-        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
-        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
-    )
-
-    filtered, enforceable = apply_response_collection_filters(
-        {
-            "scorers": [
-                {"experiment_id": "1", "scorer_name": "alpha"},
-                {"experiment_id": "2", "scorer_name": "beta"},
-            ]
-        },
-        [
-            AuthorizationRule(
-                "get",
-                resource=RESOURCE_EXPERIMENTS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
-    assert filtered == {"scorers": [{"experiment_id": "1", "scorer_name": "alpha"}]}
-
-
-def test_apply_response_collection_filters_filters_scorers_with_numeric_experiment_ids(
-    monkeypatch,
-):
-    authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "exp-a"
-    )
-    monkeypatch.setattr(
-        "mlflow_kubernetes_plugins.auth.collection_filters._resolve_experiment_name_from_experiment_id",
-        lambda experiment_id: {"1": "exp-a", "2": "exp-b"}[experiment_id],
-    )
-
-    filtered, enforceable = apply_response_collection_filters(
-        {
-            "scorers": [
-                {"experiment_id": 1, "scorer_name": "alpha"},
-                {"experiment_id": 2, "scorer_name": "beta"},
-            ]
-        },
-        [
-            AuthorizationRule(
-                "get",
-                resource=RESOURCE_EXPERIMENTS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
-    assert filtered == {"scorers": [{"experiment_id": 1, "scorer_name": "alpha"}]}
-
-
-def test_apply_response_collection_filters_not_enforceable_on_unexpected_shape():
-    authorizer = Mock()
-    authorizer.is_allowed.return_value = False
-
-    _, enforceable = apply_response_collection_filters(
-        {"experiments": "not-a-list"},
-        [
-            AuthorizationRule(
-                "list",
-                resource=RESOURCE_EXPERIMENTS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is False
-
-
-def test_apply_response_collection_filters_enforceable_when_key_absent():
-    authorizer = Mock()
-
-    _, enforceable = apply_response_collection_filters(
-        {"other_key": "value"},
-        [
-            AuthorizationRule(
-                "list",
-                resource=RESOURCE_EXPERIMENTS,
-                collection_policy=COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-            )
-        ],
-        authorizer=authorizer,
-        identity=_RequestIdentity(token="token"),
-        workspace_name="team-a",
-    )
-
-    assert enforceable is True
 
 
 def test_apply_request_collection_filter_trace_locations(monkeypatch):
@@ -4977,13 +5988,13 @@ def test_mcp_server_path_rules_use_mcpservers_resource():
             ("/api/3.0/mlflow/mcp-servers", "GET"),
             "list",
             (),
-            COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+            COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
         ),
         (
             ("/api/3.0/mlflow/mcp-servers/endpoints", "GET"),
             "list",
             (),
-            COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+            COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
         ),
         (
             ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"),

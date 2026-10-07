@@ -67,11 +67,20 @@ This is most useful for single-object operations such as:
 - creating or updating model versions, webhooks, and many gateway resources by name
 - reading artifacts or trace details that resolve back to one experiment
 
-Collection endpoints behave differently:
+Collection searches first check broad `list` permission in the workspace. An
+explicit `resourceNames: ["*"]` grant on `get` or `list` also permits the original
+query. Otherwise, the plugin discovers concrete named `get` grants through
+Kubernetes SelfSubjectRulesReview, validates each name with an access review,
+and narrows the request before MLflow queries storage. The caller's own search
+filter is combined with the authorization scope. If the installed MLflow version
+cannot enforce that scope, the plugin denies the request before dispatch.
 
-- many search and list endpoints now filter request inputs or response items down to the readable experiments
-- MCP registry collection responses filter server and binding items down to the readable MCP servers
-- some endpoints still require broader `list` access and may return `Permission denied` for callers that only have named resources
+This applies to experiment, evaluation-dataset, trace, registered-model,
+model-version, MCP server, and MCP access-endpoint searches; batch trace reads;
+scorer listing; and GraphQL model-version search. REST and AJAX variants use the
+same rules. Collection responses are not filtered or backfilled after the query.
+Other collection endpoints that already narrow explicit request IDs retain their
+request-side authorization behavior.
 
 Use the example manifest below as a starting point for both broad workspace access and name-scoped experiment access:
 
@@ -96,9 +105,7 @@ rules:
 
 When `MLFLOW_K8S_AUTH_AUTHORIZATION_MODE=subject_access_review`, the MLflow server must also be allowed to create `subjectaccessreviews.authorization.k8s.io`.
 
-That permission is included in:
-
-- [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml)
+That permission is included in [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml).
 
 ## Token Creation
 

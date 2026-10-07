@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import MutableMapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import graphql
@@ -12,8 +13,9 @@ from mlflow.protos import databricks_pb2
 
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_GRAPHQL_FILTER,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    apply_request_collection_filter,
     filter_graphql_experiment_ids,
-    filter_graphql_model_versions_result,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     RESOURCE_EXPERIMENTS,
@@ -111,7 +113,7 @@ GRAPHQL_FIELD_VERB_MAP: dict[str, str] = {
 
 GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT = "single_object"
 GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER = "request_filter"
-GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER = "response_filter"
+GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE = "request_scope"
 GRAPHQL_FIELD_AUTH_POLICY_BROAD_ONLY = "broad_only"
 
 GRAPHQL_FIELD_AUTH_POLICY_MAP: dict[str, str] = {
@@ -121,7 +123,7 @@ GRAPHQL_FIELD_AUTH_POLICY_MAP: dict[str, str] = {
     "mlflowGetMetricHistoryBulkInterval": GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT,
     "mlflowListArtifacts": GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT,
     "mlflowSearchDatasets": GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER,
-    "mlflowSearchModelVersions": GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER,
+    "mlflowSearchModelVersions": GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE,
     "test": GRAPHQL_FIELD_AUTH_POLICY_BROAD_ONLY,
     "testMutation": GRAPHQL_FIELD_AUTH_POLICY_BROAD_ONLY,
 }
@@ -351,16 +353,12 @@ def determine_graphql_rules(
     rules_map: dict[tuple[str, str, str], tuple[str, ...]] = {}
     collection_policies: dict[tuple[str, str, str], str | None] = {}
     request_filterable_keys: dict[tuple[str, str, str], bool] = {}
-    response_filter_keys: set[tuple[str, str, str]] = set()
-    # Check for nested model registry access (e.g., modelVersions on runs). Skip the extra
-    # broad registered-model get when the only nested access comes from the root
-    # mlflowSearchModelVersions response-filter path, which should stay eligible for
-    # partial-access filtering.
+    request_scope_keys: set[tuple[str, str, str]] = set()
+    # The root model-version search scopes its own result before the resolver runs.
     if query_info.has_nested_model_registry_access and any(
         not (
             GRAPHQL_FIELD_RESOURCE_MAP.get(field) == RESOURCE_REGISTERED_MODELS
-            and GRAPHQL_FIELD_AUTH_POLICY_MAP.get(field)
-            == GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER
+            and GRAPHQL_FIELD_AUTH_POLICY_MAP.get(field) == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE
         )
         for field in query_info.nested_model_registry_root_fields
     ):
@@ -387,8 +385,8 @@ def determine_graphql_rules(
             request_filterable_keys[key] = request_filterable_keys.get(key, True) and (
                 _all_request_filter_occurrences_are_filterable(query_info, field)
             )
-        elif auth_policy == GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER:
-            response_filter_keys.add(key)
+        elif auth_policy == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE:
+            request_scope_keys.add(key)
 
     if unknown_fields:
         _logger.error(
@@ -404,7 +402,7 @@ def determine_graphql_rules(
     for key, is_filterable in request_filterable_keys.items():
         if is_filterable:
             collection_policies[key] = COLLECTION_POLICY_GRAPHQL_FILTER
-    for key in response_filter_keys:
+    for key in request_scope_keys:
         collection_policies[key] = COLLECTION_POLICY_GRAPHQL_FILTER
 
     return [
@@ -526,7 +524,7 @@ class KubernetesGraphQLAuthorizationMiddleware:
         policy = GRAPHQL_FIELD_AUTH_POLICY_MAP.get(field_name)
         if policy not in {
             GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER,
-            GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER,
+            GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE,
         }:
             return next(root, info, **args)
 
@@ -538,12 +536,49 @@ class KubernetesGraphQLAuthorizationMiddleware:
         if auth_result is not None:
             identity = getattr(auth_result, "identity", None)
             resolved_workspace_name = self._resolved_workspace_name(auth_result)
-        if identity is None or not resolved_workspace_name:
+        if auth_result is None or identity is None or not resolved_workspace_name:
             _logger.warning(
                 "GraphQL collection authorization missing identity or workspace for field %s",
                 field_name,
             )
             return None
+
+        if policy == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE:
+            if self._authorizer.is_allowed(
+                identity, RESOURCE_REGISTERED_MODELS, "list", resolved_workspace_name
+            ):
+                return next(root, info, **args)
+            input_obj = args.get("input")
+            if isinstance(input_obj, MutableMapping):
+                existing_filter = input_obj.get("filter", "")
+            elif input_obj is not None:
+                existing_filter = getattr(input_obj, "filter", "")
+            else:
+                return None
+            scoped_request = replace(
+                auth_result.request_context,
+                method="GET",
+                query_params={"filter": existing_filter},
+            )
+            updated_request, applied = apply_request_collection_filter(
+                scoped_request,
+                COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+                authorizer=self._authorizer,
+                identity=identity,
+                workspace_name=resolved_workspace_name,
+            )
+            if not applied:
+                return None
+            narrowed_filter = updated_request.query_params.get("filter")
+            if not isinstance(narrowed_filter, str):
+                return None
+            try:
+                if isinstance(input_obj, MutableMapping):
+                    input_obj["filter"] = narrowed_filter
+                else:
+                    input_obj.filter = narrowed_filter
+            except (AttributeError, TypeError):
+                return None
 
         if policy == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER:
             input_obj = args.get("input")
@@ -576,17 +611,7 @@ class KubernetesGraphQLAuthorizationMiddleware:
                 elif hasattr(input_obj, "experimentIds"):
                     input_obj.experimentIds = readable_ids
 
-        result = next(root, info, **args)
-        if result is None:
-            return None
-        if policy == GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER:
-            return filter_graphql_model_versions_result(
-                result,
-                authorizer=self._authorizer,
-                identity=identity,
-                workspace_name=resolved_workspace_name,
-            )
-        return result
+        return next(root, info, **args)
 
 
 def get_graphql_authorization_middleware(authorizer):
@@ -597,7 +622,7 @@ __all__ = [
     "GRAPHQL_FIELD_AUTH_POLICY_BROAD_ONLY",
     "GRAPHQL_FIELD_AUTH_POLICY_MAP",
     "GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER",
-    "GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER",
+    "GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE",
     "GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT",
     "GRAPHQL_FIELD_RESOURCE_MAP",
     "GRAPHQL_FIELD_RESOURCE_NAME_PARSERS",

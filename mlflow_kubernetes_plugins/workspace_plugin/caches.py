@@ -390,13 +390,17 @@ class MlflowConfigCache:
 
     def _handle_event(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
-        obj = event.get("object", {})
-        metadata = obj.get("metadata", {})
+        obj = event.get("object")
+        if not isinstance(obj, dict):
+            return
+        metadata = obj.get("metadata")
+        if not isinstance(metadata, dict):
+            return
         namespace = metadata.get("namespace")
         resource_version = metadata.get("resourceVersion")
         should_ensure_secret_cache = False
 
-        if not namespace:
+        if not isinstance(namespace, str) or not namespace:
             return
 
         with self._lock:
@@ -420,16 +424,24 @@ class MlflowConfigCache:
             self._ensure_secret_cache()
 
     def _extract_info(self, obj: dict[str, object]) -> MlflowConfigInfo | None:
-        metadata = obj.get("metadata", {})
+        metadata = obj.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
         namespace = metadata.get("namespace")
-        if not namespace:
+        if not isinstance(namespace, str) or not namespace:
             return None
 
-        spec = obj.get("spec") or {}
+        spec = obj.get("spec")
+        if not isinstance(spec, dict):
+            spec = {}
+        artifact_root_path = spec.get("artifactRootPath")
+        artifact_root_secret = spec.get("artifactRootSecret")
         return MlflowConfigInfo(
             namespace=namespace,
-            artifact_root_path=spec.get("artifactRootPath"),
-            artifact_root_secret=spec.get("artifactRootSecret"),
+            artifact_root_path=artifact_root_path if isinstance(artifact_root_path, str) else None,
+            artifact_root_secret=(
+                artifact_root_secret if isinstance(artifact_root_secret, str) else None
+            ),
         )
 
     @staticmethod

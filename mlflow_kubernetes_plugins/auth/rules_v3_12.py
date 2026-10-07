@@ -61,7 +61,7 @@ def apply_v3_12_deltas(
         _gateway_guardrails_rule("list"),
     )
 
-    request_authorization_rules.update(
+    request_authorization_rules.update(  # ty: ignore[no-matching-overload]
         {
             CreatePresignedUploadUrl: _experiments_rule(
                 "update",

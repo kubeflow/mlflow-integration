@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
+import sqlparse
+from sqlparse.sql import Comparison
+from sqlparse.tokens import Keyword
+
 from mlflow_kubernetes_plugins.auth.constants import (
+    RESOURCE_DATASETS,
     RESOURCE_EXPERIMENTS,
     RESOURCE_MCP_SERVERS,
     RESOURCE_REGISTERED_MODELS,
@@ -16,12 +23,12 @@ from mlflow_kubernetes_plugins.auth.resource_names import (
     _normalize_string,
     _resolve_experiment_name_from_experiment_id,
     _resolve_experiment_name_from_run_id,
+    resolve_experiment_ids_from_names,
 )
 
 if TYPE_CHECKING:
-    from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthorizer
+    from mlflow_kubernetes_plugins.auth.authorizer import CollectionScope, KubernetesAuthorizer
     from mlflow_kubernetes_plugins.auth.core import _RequestIdentity
-    from mlflow_kubernetes_plugins.auth.rules import AuthorizationRule
 
 
 COLLECTION_POLICY_BROAD_ONLY = "broad_only"
@@ -30,34 +37,34 @@ COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS = "request_filter_experiment_ids"
 COLLECTION_POLICY_REQUEST_EXPERIMENT_ID = "request_filter_experiment_id"
 COLLECTION_POLICY_REQUEST_RUN_IDS = "request_filter_run_ids"
 COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS = "request_filter_trace_locations"
-COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES = "response_filter_dataset_summaries"
-COLLECTION_POLICY_RESPONSE_EXPERIMENTS = "response_filter_experiments"
-COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS = "response_filter_mcp_access_endpoints"
-COLLECTION_POLICY_RESPONSE_MCP_SERVERS = "response_filter_mcp_servers"
-COLLECTION_POLICY_RESPONSE_SCORERS = "response_filter_scorers"
-COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS = "response_filter_registered_models"
-COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS = "response_filter_model_versions"
-COLLECTION_POLICY_RESPONSE_TRACES = "response_filter_traces"
+COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS = "request_scope_authorized_experiment_ids"
+COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS = "request_scope_search_experiments"
+COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS = "request_scope_search_registered_models"
+COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS = "request_scope_search_model_versions"
+COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES = "request_scope_batch_get_traces"
+COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS = "request_scope_batch_get_trace_infos"
+COLLECTION_POLICY_REQUEST_LIST_SCORERS = "request_scope_list_scorers"
+COLLECTION_POLICY_REQUEST_SEARCH_DATASETS = "request_scope_search_datasets"
+COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS = "request_scope_search_mcp_servers"
+COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS = "request_scope_search_mcp_access_endpoints"
 
 _EXPERIMENT_READ_RULE = (RESOURCE_EXPERIMENTS, "get")
-_MCP_SERVER_READ_RULE = (RESOURCE_MCP_SERVERS, "get")
-_REGISTERED_MODEL_READ_RULE = (RESOURCE_REGISTERED_MODELS, "get")
 
 _REQUEST_FILTER_POLICIES = {
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
     COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS,
-}
-_RESPONSE_FILTER_POLICIES = {
-    COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
-    COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
-    COLLECTION_POLICY_RESPONSE_SCORERS,
-    COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
-    COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
-    COLLECTION_POLICY_RESPONSE_TRACES,
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
 }
 
 
@@ -65,43 +72,8 @@ def is_request_filter_policy(policy: str | None) -> bool:
     return policy in _REQUEST_FILTER_POLICIES
 
 
-def is_response_filter_policy(policy: str | None) -> bool:
-    return policy in _RESPONSE_FILTER_POLICIES
-
-
 def is_graphql_collection_policy(policy: str | None) -> bool:
     return policy == COLLECTION_POLICY_GRAPHQL_FILTER
-
-
-def response_filter_policies(rules: list["AuthorizationRule"]) -> set[str]:
-    return {
-        rule.collection_policy
-        for rule in rules
-        if is_response_filter_policy(rule.collection_policy)
-    }
-
-
-def can_skip_response_collection_filters(
-    rules: list["AuthorizationRule"],
-    *,
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    """Return True when the caller already has the broad permissions for every response filter."""
-    applicable_rules = [rule for rule in rules if is_response_filter_policy(rule.collection_policy)]
-    return bool(applicable_rules) and all(
-        bool(rule.resource)
-        and bool(rule.verb)
-        and authorizer.is_allowed(
-            identity,
-            rule.resource,
-            rule.verb,
-            workspace_name,
-            rule.subresource,
-        )
-        for rule in applicable_rules
-    )
 
 
 def _is_allowed_named_resource(
@@ -127,14 +99,6 @@ def _first_present_value(mapping: dict[str, object], *candidate_keys: str) -> ob
         if key in mapping:
             return mapping.get(key)
     return None
-
-
-def _normalize_string_or_int(value: object) -> str | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return str(value)
-    return _normalize_string(value)
 
 
 def _can_read_experiment_id(
@@ -427,6 +391,424 @@ def _filter_request_trace_locations(
     return replace(request_context, json_body=filtered_body), True
 
 
+def _filter_request_authorized_experiment_ids(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+    *,
+    scope: "CollectionScope | None" = None,
+) -> tuple[AuthorizationRequest, bool]:
+    if scope is None:
+        scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
+    if scope.broad:
+        return request_context, True
+    if not scope.names:
+        return request_context, False
+
+    try:
+        allowed_ids = set(resolve_experiment_ids_from_names(scope.names))
+    except ResourceNameResolutionError:
+        return request_context, False
+    if not allowed_ids:
+        return request_context, False
+
+    body = request_context.json_body
+    query = request_context.query_params
+    # MLflow accepts protobuf JSON aliases in request bodies, but its GET parser
+    # recognizes protobuf field names only.
+    body_id_keys = ("experiment_ids", "experimentIds")
+    query_id_keys = ("experiment_ids",)
+    body_keys = [key for key in body_id_keys if isinstance(body, dict) and key in body]
+    query_keys = [key for key in query_id_keys if key in query]
+
+    def request_ids(value: object, *, allow_scalar: bool) -> set[str] | None:
+        if allow_scalar and isinstance(value, str):
+            return {value} if value else None
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item for item in value)
+        ):
+            return set(value)
+        return None
+
+    selected_ids = allowed_ids
+    for key in body_keys:
+        assert isinstance(body, dict)
+        body_ids = request_ids(body[key], allow_scalar=False)
+        if body_ids is None:
+            return request_context, False
+        selected_ids &= body_ids
+    for key in query_keys:
+        query_ids = request_ids(query[key], allow_scalar=True)
+        if query_ids is None:
+            return request_context, False
+        selected_ids &= query_ids
+    if not selected_ids:
+        return request_context, False
+
+    narrowed_ids = sorted(selected_ids)
+    method = request_context.method.upper()
+    if method == "POST" and not isinstance(body, dict):
+        return request_context, False
+    if body_keys or method == "POST":
+        assert isinstance(body, dict)
+        narrowed_body = {key: value for key, value in body.items() if key not in body_id_keys}
+        narrowed_body["experiment_ids"] = narrowed_ids
+        request_context = replace(request_context, json_body=narrowed_body)
+    if query_keys or method != "POST":
+        narrowed_query = {key: value for key, value in query.items() if key not in query_id_keys}
+        narrowed_query["experiment_ids"] = narrowed_ids
+        request_context = replace(request_context, query_params=narrowed_query)
+    return request_context, True
+
+
+def _batch_trace_scope_supported(*, infos: bool) -> bool:
+    from mlflow.protos.service_pb2 import BatchGetTraces
+
+    from mlflow_kubernetes_plugins.auth._compat import BatchGetTraceInfos
+
+    message = BatchGetTraceInfos if infos else BatchGetTraces
+    descriptor = getattr(message, "DESCRIPTOR", None)
+    return "experiment_ids" in getattr(descriptor, "fields_by_name", {})
+
+
+def _filter_request_list_scorers(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> tuple[AuthorizationRequest, bool]:
+    if request_context.method.upper() != "GET":
+        return request_context, False
+    query = request_context.query_params
+    # ListScorers is a GET endpoint. MLflow's GET parser recognizes protobuf
+    # field names only, not their JSON camelCase aliases. Do not authorize an
+    # unmodified request based on an alias MLflow would ignore.
+    if "experiment_id" in query and "experiment_ids" in query:
+        return request_context, False
+    if "experiment_id" in query:
+        experiment_id = _normalize_string(query["experiment_id"])
+        if experiment_id is None:
+            return request_context, False
+        return request_context, _can_read_experiment_id(
+            authorizer, identity, workspace_name, experiment_id
+        )
+
+    scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
+    if scope.broad:
+        return request_context, True
+    from mlflow.protos.service_pb2 import ListScorers
+
+    descriptor = getattr(ListScorers, "DESCRIPTOR", None)
+    if "experiment_ids" not in getattr(descriptor, "fields_by_name", {}):
+        return request_context, False
+    return _filter_request_authorized_experiment_ids(
+        request_context, authorizer, identity, workspace_name, scope=scope
+    )
+
+
+def _filter_request_search_datasets(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> tuple[AuthorizationRequest, bool]:
+    scope = authorizer.discover_collection_scope(identity, RESOURCE_DATASETS, workspace_name)
+    if scope.broad:
+        return request_context, True
+    if not scope.names:
+        return request_context, False
+    method = request_context.method.upper()
+    body = request_context.json_body
+    if method not in {"GET", "POST"} or (method == "POST" and not isinstance(body, dict)):
+        return request_context, False
+
+    if len(scope.names) == 1:
+        scope_filter = f"name = {scope.names[0]!r}"
+        comparator = "="
+        expected_value: str | tuple[str, ...] = scope.names[0]
+    else:
+        scope_filter = "name IN (" + ", ".join(repr(name) for name in scope.names) + ")"
+        comparator = "IN"
+        expected_value = scope.names
+
+    caller_filters: list[str] = []
+    for source in (body, request_context.query_params):
+        if not isinstance(source, dict) or "filter_string" not in source:
+            continue
+        value = source["filter_string"]
+        if not isinstance(value, str):
+            return request_context, False
+        if value.strip():
+            caller_filters.append(value.strip())
+    if caller_filters:
+        statements = sqlparse.parse(" AND ".join(caller_filters))
+        if len(statements) != 1 or any(
+            not (
+                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
+            )
+            for token in statements[0].tokens
+        ):
+            return request_context, False
+    narrowed_filter = " AND ".join([*caller_filters, scope_filter])
+    try:
+        from mlflow.store.tracking.sqlalchemy_store import _get_search_datasets_filter_clauses
+        from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
+
+        parsed = SearchEvaluationDatasetsUtils.parse_search_filter(narrowed_filter)
+        expected_scope = {
+            "type": "attribute",
+            "key": "name",
+            "comparator": comparator,
+            "value": expected_value,
+        }
+        if not parsed or parsed[-1] != expected_scope:
+            return request_context, False
+        if comparator == "IN":
+            attribute_filters, non_attribute_filters = _get_search_datasets_filter_clauses(
+                [expected_scope], "sqlite"
+            )
+            if len(attribute_filters) != 1 or non_attribute_filters:
+                return request_context, False
+    except Exception:
+        return request_context, False
+
+    if method == "POST":
+        assert isinstance(body, dict)
+        return replace(request_context, json_body={**body, "filter_string": narrowed_filter}), True
+    return replace(
+        request_context,
+        query_params={**request_context.query_params, "filter_string": narrowed_filter},
+    ), True
+
+
+def _filter_request_search_mcp(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+    *,
+    access_endpoints: bool = False,
+) -> tuple[AuthorizationRequest, bool]:
+    scope = authorizer.discover_collection_scope(identity, RESOURCE_MCP_SERVERS, workspace_name)
+    if scope.broad:
+        return request_context, True
+    if not scope.names or request_context.method.upper() != "GET":
+        return request_context, False
+    key = "server_name" if access_endpoints else "name"
+    if len(scope.names) == 1:
+        scope_filter = f"{key} = {scope.names[0]!r}"
+        comparator = "="
+        expected_value: str | tuple[str, ...] = scope.names[0]
+    else:
+        scope_filter = f"{key} IN (" + ", ".join(repr(name) for name in scope.names) + ")"
+        comparator = "IN"
+        expected_value = scope.names
+
+    existing_filter = request_context.query_params.get("filter_string", "")
+    if not isinstance(existing_filter, str):
+        return request_context, False
+    existing_filter = existing_filter.strip()
+    if existing_filter:
+        statements = sqlparse.parse(existing_filter)
+        if len(statements) != 1 or any(
+            not (
+                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
+            )
+            for token in statements[0].tokens
+        ):
+            return request_context, False
+    narrowed_filter = f"{existing_filter} AND {scope_filter}" if existing_filter else scope_filter
+    try:
+        from mlflow.utils.search_utils import SearchMCPAccessEndpointUtils, SearchMCPServerUtils
+
+        parser = SearchMCPAccessEndpointUtils if access_endpoints else SearchMCPServerUtils
+        parsed = parser.parse_search_filter(narrowed_filter)
+        if not parsed or parsed[-1] != {
+            "type": "attribute",
+            "key": key,
+            "comparator": comparator,
+            "value": expected_value,
+        }:
+            return request_context, False
+    except Exception:
+        return request_context, False
+    return replace(
+        request_context,
+        query_params={**request_context.query_params, "filter_string": narrowed_filter},
+    ), True
+
+
+@lru_cache(maxsize=1)
+def _supports_search_experiments_id_in() -> bool:
+    """Require both the MLflow parser and SQL store to understand ID lists."""
+    try:
+        from mlflow.store.tracking.sqlalchemy_store import _get_search_experiments_filter_clauses
+        from mlflow.utils.search_utils import SearchExperimentsUtils
+
+        parsed = SearchExperimentsUtils.parse_search_filter("experiment_id IN ('1', '2')")
+        if len(parsed) != 1 or parsed[0] != {
+            "type": "attribute",
+            "key": "experiment_id",
+            "comparator": "IN",
+            "value": ("1", "2"),
+        }:
+            return False
+        attribute_filters, non_attribute_filters = _get_search_experiments_filter_clauses(
+            parsed, "sqlite"
+        )
+        return len(attribute_filters) == 1 and not non_attribute_filters
+    except Exception:
+        return False
+
+
+def _filter_request_search_experiments(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+) -> tuple[AuthorizationRequest, bool]:
+    scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
+    if scope.broad:
+        return request_context, True
+    if not scope.names:
+        return request_context, False
+    if len(scope.names) == 1:
+        # Equality is supported by released MLflow and needs no name-to-ID lookup.
+        scope_filter = f"name = {scope.names[0]!r}"
+        expected_scope = {
+            "type": "attribute",
+            "key": "name",
+            "comparator": "=",
+            "value": scope.names[0],
+        }
+    else:
+        try:
+            experiment_ids = sorted(set(resolve_experiment_ids_from_names(scope.names)))
+        except ResourceNameResolutionError:
+            return request_context, False
+        # SQL-backed MLflow experiment IDs are decimal strings. Restrict the injected
+        # literal grammar even though the IDs came from the tracking store.
+        if (
+            not experiment_ids
+            or any(not re.fullmatch(r"[0-9]+", value) for value in experiment_ids)
+            or not _supports_search_experiments_id_in()
+        ):
+            return request_context, False
+        scope_filter = (
+            "experiment_id IN (" + ", ".join(f"'{value}'" for value in experiment_ids) + ")"
+        )
+        expected_scope = {
+            "type": "attribute",
+            "key": "experiment_id",
+            "comparator": "IN",
+            "value": tuple(experiment_ids),
+        }
+
+    body = request_context.json_body
+    method = request_context.method.upper()
+    if method not in {"GET", "POST"} or (method == "POST" and not isinstance(body, dict)):
+        return request_context, False
+    filters: list[str] = []
+    for source in (body, request_context.query_params):
+        if not isinstance(source, dict) or "filter" not in source:
+            continue
+        value = source["filter"]
+        if not isinstance(value, str):
+            return request_context, False
+        if value.strip():
+            filters.append(value.strip())
+    if filters:
+        statements = sqlparse.parse(" AND ".join(filters))
+        if len(statements) != 1 or any(
+            not (
+                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
+            )
+            for token in statements[0].tokens
+        ):
+            return request_context, False
+    narrowed_filter = " AND ".join([*filters, scope_filter])
+    try:
+        from mlflow.utils.search_utils import SearchExperimentsUtils
+
+        parsed = SearchExperimentsUtils.parse_search_filter(narrowed_filter)
+        if not parsed or parsed[-1] != expected_scope:
+            return request_context, False
+    except Exception:
+        return request_context, False
+    if method == "POST":
+        assert isinstance(body, dict)
+        request_context = replace(request_context, json_body={**body, "filter": narrowed_filter})
+    else:
+        request_context = replace(
+            request_context,
+            query_params={**request_context.query_params, "filter": narrowed_filter},
+        )
+    return request_context, True
+
+
+def _filter_request_registered_model_search(
+    request_context: AuthorizationRequest,
+    authorizer: "KubernetesAuthorizer",
+    identity: "_RequestIdentity",
+    workspace_name: str,
+    *,
+    model_versions: bool,
+) -> tuple[AuthorizationRequest, bool]:
+    scope = authorizer.discover_collection_scope(
+        identity, RESOURCE_REGISTERED_MODELS, workspace_name
+    )
+    if scope.broad:
+        return request_context, True
+    if not scope.names or request_context.method.upper() != "GET":
+        return request_context, False
+
+    if len(scope.names) == 1:
+        scope_filter = f"name = {scope.names[0]!r}"
+        comparator = "="
+        expected_value: str | tuple[str, ...] = scope.names[0]
+    else:
+        scope_filter = "name IN (" + ", ".join(repr(name) for name in scope.names) + ")"
+        comparator = "IN"
+        expected_value = scope.names
+
+    existing_filter = request_context.query_params.get("filter", "")
+    if not isinstance(existing_filter, str):
+        return request_context, False
+    existing_filter = existing_filter.strip()
+    if existing_filter:
+        statements = sqlparse.parse(existing_filter)
+        if len(statements) != 1 or any(
+            not (
+                token.is_whitespace or isinstance(token, Comparison) or token.match(Keyword, "AND")
+            )
+            for token in statements[0].tokens
+        ):
+            return request_context, False
+    narrowed_filter = f"{existing_filter} AND {scope_filter}" if existing_filter else scope_filter
+    try:
+        from mlflow.utils.search_utils import SearchModelUtils, SearchModelVersionUtils
+
+        parser = SearchModelVersionUtils if model_versions else SearchModelUtils
+        parsed = parser.parse_search_filter(narrowed_filter)
+        if not parsed or parsed[-1] != {
+            "type": "attribute",
+            "key": "name",
+            "comparator": comparator,
+            "value": expected_value,
+        }:
+            return request_context, False
+    except Exception:
+        # An older or incomplete MLflow build cannot safely express this scope.
+        return request_context, False
+    return replace(
+        request_context,
+        query_params={**request_context.query_params, "filter": narrowed_filter},
+    ), True
+
+
 def apply_request_collection_filter(
     request_context: AuthorizationRequest,
     policy: str | None,
@@ -453,298 +835,49 @@ def apply_request_collection_filter(
         return _filter_request_trace_locations(
             request_context, authorizer, identity, workspace_name
         )
+    if policy == COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS:
+        return _filter_request_authorized_experiment_ids(
+            request_context, authorizer, identity, workspace_name
+        )
+    if policy in {
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
+        COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    }:
+        scope = authorizer.discover_collection_scope(identity, RESOURCE_EXPERIMENTS, workspace_name)
+        if scope.broad:
+            return request_context, True
+        if not _batch_trace_scope_supported(
+            infos=policy == COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS
+        ):
+            return request_context, False
+        return _filter_request_authorized_experiment_ids(
+            request_context, authorizer, identity, workspace_name, scope=scope
+        )
+    if policy == COLLECTION_POLICY_REQUEST_LIST_SCORERS:
+        return _filter_request_list_scorers(request_context, authorizer, identity, workspace_name)
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_DATASETS:
+        return _filter_request_search_datasets(
+            request_context, authorizer, identity, workspace_name
+        )
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS:
+        return _filter_request_search_mcp(request_context, authorizer, identity, workspace_name)
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS:
+        return _filter_request_search_mcp(
+            request_context, authorizer, identity, workspace_name, access_endpoints=True
+        )
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS:
+        return _filter_request_search_experiments(
+            request_context, authorizer, identity, workspace_name
+        )
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS:
+        return _filter_request_registered_model_search(
+            request_context, authorizer, identity, workspace_name, model_versions=False
+        )
+    if policy == COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS:
+        return _filter_request_registered_model_search(
+            request_context, authorizer, identity, workspace_name, model_versions=True
+        )
     return request_context, False
-
-
-def _filter_payload_experiments(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    experiments = payload.get("experiments")
-    if experiments is None:
-        return True
-    if not isinstance(experiments, list):
-        return False
-    payload["experiments"] = [
-        experiment
-        for experiment in experiments
-        if isinstance(experiment, dict)
-        and (experiment_name := _normalize_string(experiment.get("name")))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _EXPERIMENT_READ_RULE,
-            experiment_name,
-        )
-    ]
-    return True
-
-
-def _filter_payload_dataset_summaries(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    enforced = True
-    for payload_key in ("datasets", "dataset_summaries"):
-        value = payload.get(payload_key)
-        if value is None:
-            continue
-        if not isinstance(value, list):
-            enforced = False
-            continue
-        filtered_summaries: list[dict[str, object]] = []
-        for summary in value:
-            if not isinstance(summary, dict):
-                continue
-            experiment_id = _normalize_string(
-                _first_present_value(summary, "experiment_id", "experimentId")
-            )
-            if experiment_id is None:
-                continue
-            if _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id):
-                filtered_summaries.append(summary)
-        payload[payload_key] = filtered_summaries
-    return enforced
-
-
-def _filter_payload_registered_models(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    registered_models = payload.get("registered_models")
-    if registered_models is None:
-        return True
-    if not isinstance(registered_models, list):
-        return False
-    payload["registered_models"] = [
-        model
-        for model in registered_models
-        if isinstance(model, dict)
-        and (model_name := _normalize_string(model.get("name")))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _REGISTERED_MODEL_READ_RULE,
-            model_name,
-        )
-    ]
-    return True
-
-
-def _filter_payload_mcp_servers(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    mcp_servers = payload.get("mcp_servers")
-    if mcp_servers is None:
-        return True
-    if not isinstance(mcp_servers, list):
-        return False
-    payload["mcp_servers"] = [
-        server
-        for server in mcp_servers
-        if isinstance(server, dict)
-        and (server_name := _normalize_string(server.get("name")))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _MCP_SERVER_READ_RULE,
-            server_name,
-        )
-    ]
-    return True
-
-
-def _filter_payload_mcp_access_endpoints(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    endpoints = payload.get("mcp_access_endpoints")
-    if endpoints is None:
-        return True
-    if not isinstance(endpoints, list):
-        return False
-    payload["mcp_access_endpoints"] = [
-        endpoint
-        for endpoint in endpoints
-        if isinstance(endpoint, dict)
-        and (server_name := _normalize_string(endpoint.get("server_name")))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _MCP_SERVER_READ_RULE,
-            server_name,
-        )
-    ]
-    return True
-
-
-def _filter_payload_scorers(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    scorers = payload.get("scorers")
-    if scorers is None:
-        return True
-    if not isinstance(scorers, list):
-        return False
-    filtered_scorers: list[dict[str, object]] = []
-    for scorer in scorers:
-        if not isinstance(scorer, dict):
-            continue
-        experiment_id = _normalize_string_or_int(
-            _first_present_value(scorer, "experiment_id", "experimentId")
-        )
-        if experiment_id is None:
-            continue
-        if _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id):
-            filtered_scorers.append(scorer)
-    payload["scorers"] = filtered_scorers
-    return True
-
-
-def _filter_payload_model_versions(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    model_versions = payload.get("model_versions")
-    if model_versions is None:
-        return True
-    if not isinstance(model_versions, list):
-        return False
-    payload["model_versions"] = [
-        model_version
-        for model_version in model_versions
-        if isinstance(model_version, dict)
-        and (model_name := _normalize_string(model_version.get("name")))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _REGISTERED_MODEL_READ_RULE,
-            model_name,
-        )
-    ]
-    return True
-
-
-def _trace_experiment_id(trace: dict[str, object]) -> str | None:
-    """Extract an experiment ID from trace payloads across MLflow's mixed field spellings."""
-    trace_info = trace.get("trace_info") or trace.get("traceInfo") or trace.get("info")
-    if isinstance(trace_info, dict):
-        experiment_id = _normalize_string(
-            _first_present_value(trace_info, "experiment_id", "experimentId")
-        )
-        if experiment_id is not None:
-            return experiment_id
-        trace_location = _first_present_value(trace_info, "trace_location", "traceLocation")
-        if isinstance(trace_location, dict):
-            mlflow_location = _first_present_value(
-                trace_location, "mlflow_experiment", "mlflowExperiment"
-            )
-            if isinstance(mlflow_location, dict):
-                return _normalize_string(
-                    _first_present_value(mlflow_location, "experiment_id", "experimentId")
-                )
-    return None
-
-
-def _filter_payload_traces(
-    payload: dict[str, object],
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> bool:
-    enforced = True
-    for payload_key in ("traces", "trace_infos"):
-        value = payload.get(payload_key)
-        if value is None:
-            continue
-        if not isinstance(value, list):
-            enforced = False
-            continue
-        filtered_traces: list[dict[str, object]] = []
-        for trace in value:
-            if not isinstance(trace, dict):
-                continue
-            experiment_id = _trace_experiment_id(trace)
-            if experiment_id is None:
-                continue
-            if _can_read_experiment_id(authorizer, identity, workspace_name, experiment_id):
-                filtered_traces.append(trace)
-        payload[payload_key] = filtered_traces
-    return enforced
-
-
-def apply_response_collection_filters(
-    payload: dict[str, object],
-    rules: list["AuthorizationRule"],
-    *,
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-) -> tuple[dict[str, object], bool]:
-    """Filter response collections and report whether all filters could enforce.
-
-    Returns ``(filtered_payload, enforceable)`` where *enforceable* is ``False``
-    when any expected collection key was present but had an unrecognizable type,
-    meaning the filter could not guarantee that unauthorized data was removed.
-    """
-    filtered_payload = dict(payload)
-    enforceable = True
-    applied_policies = response_filter_policies(rules)
-    for policy in applied_policies:
-        if policy == COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES:
-            enforceable &= _filter_payload_dataset_summaries(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_EXPERIMENTS:
-            enforceable &= _filter_payload_experiments(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS:
-            enforceable &= _filter_payload_mcp_access_endpoints(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_MCP_SERVERS:
-            enforceable &= _filter_payload_mcp_servers(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_SCORERS:
-            enforceable &= _filter_payload_scorers(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS:
-            enforceable &= _filter_payload_registered_models(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS:
-            enforceable &= _filter_payload_model_versions(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-        elif policy == COLLECTION_POLICY_RESPONSE_TRACES:
-            enforceable &= _filter_payload_traces(
-                filtered_payload, authorizer, identity, workspace_name
-            )
-    return filtered_payload, enforceable
 
 
 def filter_graphql_experiment_ids(
@@ -756,32 +889,6 @@ def filter_graphql_experiment_ids(
     return filter_readable_experiment_ids(authorizer, identity, workspace_name, experiment_ids)
 
 
-def filter_graphql_model_versions_result(
-    result: object,
-    *,
-    authorizer: "KubernetesAuthorizer",
-    identity: "_RequestIdentity",
-    workspace_name: str,
-):
-    if not hasattr(result, "model_versions") or result.model_versions is None:
-        return None
-    filtered = [
-        model_version
-        for model_version in result.model_versions
-        if (model_name := _normalize_string(getattr(model_version, "name", None)))
-        and _is_allowed_named_resource(
-            authorizer,
-            identity,
-            workspace_name,
-            _REGISTERED_MODEL_READ_RULE,
-            model_name,
-        )
-    ]
-    del result.model_versions[:]
-    result.model_versions.extend(filtered)
-    return result
-
-
 __all__ = [
     "COLLECTION_POLICY_BROAD_ONLY",
     "COLLECTION_POLICY_GRAPHQL_FILTER",
@@ -789,22 +896,19 @@ __all__ = [
     "COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS",
     "COLLECTION_POLICY_REQUEST_RUN_IDS",
     "COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS",
-    "COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES",
-    "COLLECTION_POLICY_RESPONSE_EXPERIMENTS",
-    "COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS",
-    "COLLECTION_POLICY_RESPONSE_MCP_SERVERS",
-    "COLLECTION_POLICY_RESPONSE_SCORERS",
-    "COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS",
-    "COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS",
-    "COLLECTION_POLICY_RESPONSE_TRACES",
+    "COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS",
+    "COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES",
+    "COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS",
+    "COLLECTION_POLICY_REQUEST_LIST_SCORERS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_DATASETS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS",
+    "COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS",
     "apply_request_collection_filter",
-    "apply_response_collection_filters",
-    "can_skip_response_collection_filters",
     "filter_graphql_experiment_ids",
-    "filter_graphql_model_versions_result",
     "filter_readable_run_ids",
     "is_graphql_collection_policy",
     "is_request_filter_policy",
-    "is_response_filter_policy",
-    "response_filter_policies",
 ]

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from mlflow_kubernetes_plugins.auth._compat import CreatePresignedDownloadUrl
 from mlflow_kubernetes_plugins.auth.collection_filters import (
-    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
 )
 from mlflow_kubernetes_plugins.auth.resource_names import (
     RESOURCE_NAME_PARSER_ARTIFACT_EXPERIMENT_ID_TO_NAME,
@@ -81,11 +81,11 @@ def apply_mcp_registry_deltas(
                 (prefix, "POST"): _mcp_servers_rule("create"),
                 (prefix, "GET"): _mcp_servers_rule(
                     "list",
-                    collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+                    collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
                 ),
                 (f"{prefix}/endpoints", "GET"): _mcp_servers_rule(
                     "list",
-                    collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+                    collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
                 ),
                 (f"{prefix}/<path:name>/versions", "POST"): _mcp_servers_rule(
                     "update",

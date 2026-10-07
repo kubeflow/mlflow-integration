@@ -6,7 +6,7 @@ import pytest
 from flask import Flask
 from mlflow.exceptions import MlflowException
 from mlflow.protos.service_pb2 import CreateRun
-from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthConfig
+from mlflow_kubernetes_plugins.auth.authorizer import CollectionScope, KubernetesAuthConfig
 from mlflow_kubernetes_plugins.auth.collection_filters import COLLECTION_POLICY_GRAPHQL_FILTER
 from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
 from mlflow_kubernetes_plugins.auth.core import (
@@ -17,7 +17,7 @@ from mlflow_kubernetes_plugins.auth.core import (
 from mlflow_kubernetes_plugins.auth.graphql import (
     GRAPHQL_FIELD_AUTH_POLICY_MAP,
     GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER,
-    GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER,
+    GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE,
     GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT,
     GRAPHQL_FIELD_RESOURCE_MAP,
     GRAPHQL_FIELD_VERB_MAP,
@@ -105,7 +105,7 @@ def test_graphql_field_maps_are_consistent():
     )
     assert (
         GRAPHQL_FIELD_AUTH_POLICY_MAP["mlflowSearchModelVersions"]
-        == GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER
+        == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE
     )
 
 
@@ -517,7 +517,7 @@ def test_graphql_query_parsing_mixed_query():
     rules = _find_authorization_rules("/graphql", "POST", graphql_payload={"query": query})
     # Mixed queries return 2 rules:
     # - experiments:get (from mlflowGetExperiment)
-    # - registeredmodels:list (from mlflowSearchModelVersions, filtered at response time)
+    # - registeredmodels:list (from mlflowSearchModelVersions, scoped before resolution)
     assert rules is not None
     assert len(rules) == 2
     resources = {r.resource for r in rules}
@@ -543,7 +543,7 @@ def test_graphql_operation_name_does_not_bypass_query_parsing():
     assert RESOURCE_REGISTERED_MODELS in resources
 
 
-def test_authorize_request_graphql_search_model_versions_defers_to_response_filter(monkeypatch):
+def test_authorize_request_graphql_search_model_versions_defers_named_scope(monkeypatch):
     authorizer = Mock()
     authorizer.is_allowed.return_value = False
     monkeypatch.setattr(
@@ -567,11 +567,7 @@ def test_authorize_request_graphql_search_model_versions_defers_to_response_filt
         authorizer=authorizer,
         config_values=KubernetesAuthConfig(),
     )
-
-    assert len(result.rules) == 1
-    assert result.rules[0].resource == RESOURCE_REGISTERED_MODELS
-    assert result.rules[0].verb == "list"
-    assert result.rules[0].collection_policy == COLLECTION_POLICY_GRAPHQL_FILTER
+    assert result.request_context.path == "/graphql"
     assert authorizer.is_allowed.call_count == 1
 
 
@@ -1026,31 +1022,86 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
     assert result == ["1"]
 
 
-def test_kubernetes_graphql_middleware_filters_model_versions_response():
+def test_kubernetes_graphql_middleware_scopes_model_version_filter():
     app = Flask(__name__)
     authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "model-a"
-    )
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
     middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
     result_obj = SimpleNamespace(
         model_versions=[SimpleNamespace(name="model-a"), SimpleNamespace(name="model-b")]
     )
+    input_obj = SimpleNamespace(filter="name ILIKE 'model%'")
+    resolver = Mock(return_value=result_obj)
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             info = SimpleNamespace(field_name="mlflowSearchModelVersions")
-            filtered = middleware.resolve(
-                lambda _root, _info, **_kwargs: result_obj,
+            result = middleware.resolve(resolver, None, info, input=input_obj)
+        finally:
+            _AUTHORIZATION_HANDLED.reset(token)
+
+    assert result is result_obj
+    assert input_obj.filter == "name ILIKE 'model%' AND name = 'model-a'"
+    resolver.assert_called_once()
+    assert resolver.call_args.kwargs["input"] is input_obj
+
+
+def test_kubernetes_graphql_model_search_denies_without_named_scope():
+    app = Flask(__name__)
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope()
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
+    resolver = Mock()
+
+    with app.test_request_context("/graphql"):
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+        try:
+            result = middleware.resolve(
+                resolver,
                 None,
-                info,
-                input=SimpleNamespace(filter=""),
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": ""},
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
 
-    assert [model.name for model in filtered.model_versions] == ["model-a"]
+    assert result is None
+    resolver.assert_not_called()
+    authorizer.discover_collection_scope.assert_called_once()
+
+
+def test_kubernetes_graphql_model_search_preserves_each_alias():
+    app = Flask(__name__)
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
+    resolver = Mock(side_effect=lambda _root, _info, **kwargs: kwargs["input"]["filter"])
+
+    with app.test_request_context("/graphql"):
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+        try:
+            first = middleware.resolve(
+                resolver,
+                None,
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": "name ILIKE 'a%'"},
+            )
+            second = middleware.resolve(
+                resolver,
+                None,
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": "name ILIKE 'b%'"},
+            )
+        finally:
+            _AUTHORIZATION_HANDLED.reset(token)
+
+    assert first == "name ILIKE 'a%' AND name = 'model-a'"
+    assert second == "name ILIKE 'b%' AND name = 'model-a'"
+    assert resolver.call_count == 2
 
 
 def test_kubernetes_graphql_middleware_tolerates_missing_request_context():

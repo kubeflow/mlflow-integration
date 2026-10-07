@@ -110,7 +110,7 @@ jobs:
           if [[ "${{ matrix.mlflow-version }}" == "upstream-pre-request-auth" ]]; then
             uv pip install --no-deps -e .
             uv pip install \
-              "mlflow @ https://github.com/mlflow/mlflow/archive/aebec5c03a3cc8e97f2dd0ba30217ef946e1c218.tar.gz" \
+              "mlflow @ https://github.com/mlflow/mlflow/archive/df65fa13986bef0f44858920570bdb7ef07d469d.tar.gz" \
               kubernetes \
               graphql-core \
               httpx \
@@ -155,7 +155,7 @@ jobs:
           if [[ "${{ matrix.mlflow-version }}" == "upstream-pre-request-auth" ]]; then
             uv pip install --no-deps -e .
             uv pip install \
-              "mlflow @ https://github.com/mlflow/mlflow/archive/aebec5c03a3cc8e97f2dd0ba30217ef946e1c218.tar.gz" \
+              "mlflow @ https://github.com/mlflow/mlflow/archive/df65fa13986bef0f44858920570bdb7ef07d469d.tar.gz" \
               kubernetes \
               graphql-core \
               httpx \

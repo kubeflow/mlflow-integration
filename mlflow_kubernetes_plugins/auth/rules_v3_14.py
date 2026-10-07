@@ -41,7 +41,7 @@ def apply_v3_14_deltas(
 ) -> None:
     experiment_id_parsers = (RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,)
 
-    request_authorization_rules.update(
+    request_authorization_rules.update(  # ty: ignore[no-matching-overload]
         {
             # Label schema CRUD — experiment-scoped.
             # Endpoints carrying experiment_id get experiment-level resourceName checks.

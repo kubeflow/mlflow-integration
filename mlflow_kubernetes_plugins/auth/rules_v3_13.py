@@ -5,10 +5,9 @@ from __future__ import annotations
 from mlflow.protos.service_pb2 import ListScorers
 
 from mlflow_kubernetes_plugins.auth.collection_filters import (
-    COLLECTION_POLICY_RESPONSE_SCORERS,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
 )
 from mlflow_kubernetes_plugins.auth.resource_names import (
-    RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,
     RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,
 )
 from mlflow_kubernetes_plugins.auth.rules import (
@@ -27,10 +26,8 @@ def apply_v3_13_deltas(
     ],
 ) -> None:
     request_authorization_rules[ListScorers] = _experiments_rule(
-        "get",
-        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
-        fallback_to_collection_policy_on_missing_resource_reference=True,
+        "list",
+        collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     )
     path_authorization_rules.update(
         {

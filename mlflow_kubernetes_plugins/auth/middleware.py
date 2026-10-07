@@ -26,10 +26,6 @@ from starlette.types import Scope
 
 import mlflow_kubernetes_plugins.auth.core as core_mod
 from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthConfig, KubernetesAuthorizer
-from mlflow_kubernetes_plugins.auth.collection_filters import (
-    apply_response_collection_filters,
-    can_skip_response_collection_filters,
-)
 from mlflow_kubernetes_plugins.auth.compiler import (
     _compile_authorization_rules,
     _extract_path_params,
@@ -201,51 +197,9 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
             updated_payload["workspaces"] = filtered_workspaces
             self._replace_json_response_payload(response, updated_payload)
 
-    async def _apply_collection_response_filters(
-        self,
-        response,
-        *,
-        auth_result,
-        response_workspace_name: str | None,
-    ) -> None:
-        if not auth_result.response_filter_required:
-            return
-        if not response_workspace_name or response.status_code >= 400:
-            return
-        if can_skip_response_collection_filters(
-            auth_result.rules,
-            authorizer=self.authorizer,
-            identity=auth_result.identity,
-            workspace_name=response_workspace_name,
-        ):
-            return
-        payload, _ = await self._read_json_response_payload(response)
-        if not isinstance(payload, dict):
-            self._replace_json_response_payload(response, {})
-            return
-        filtered_payload, enforceable = apply_response_collection_filters(
-            payload,
-            auth_result.rules,
-            authorizer=self.authorizer,
-            identity=auth_result.identity,
-            workspace_name=response_workspace_name,
-        )
-        if not enforceable:
-            self._replace_json_response_payload(response, {})
-        elif filtered_payload != payload:
-            self._replace_json_response_payload(response, filtered_payload)
-
     async def _apply_response_authorization_filters(self, response, *, auth_result) -> None:
-        response_workspace_name = None
-        if isinstance(auth_result.request_context.workspace, str):
-            response_workspace_name = auth_result.request_context.workspace.strip() or None
         if auth_result.rules[0].apply_workspace_filter and response.status_code < 400:
             await self._filter_workspace_list_response(response, auth_result=auth_result)
-        await self._apply_collection_response_filters(
-            response,
-            auth_result=auth_result,
-            response_workspace_name=response_workspace_name,
-        )
 
     @staticmethod
     async def _read_json_response_payload(
@@ -342,8 +296,8 @@ class KubernetesAuthMiddleware(BaseHTTPMiddleware):
                     workspace_context.set_server_request_workspace(resolved_workspace_name)
                     workspace_set = True
 
-            path_params = _extract_path_params(canonical_path, request.method) or dict(
-                request.path_params
+            path_params: dict[str, object] = dict(
+                _extract_path_params(canonical_path, request.method) or request.path_params
             )
 
             async def _ensure_auth_request_json_body():
@@ -420,7 +374,7 @@ def create_app(app: Flask | None = None):
     config_values = KubernetesAuthConfig.from_env()
     authorizer = KubernetesAuthorizer(config_values=config_values)
     atexit.register(authorizer.close)
-    mlflow_handlers._get_graphql_auth_middleware = _registered_graphql_auth_middleware
+    setattr(mlflow_handlers, "_get_graphql_auth_middleware", _registered_graphql_auth_middleware)
 
     _compile_authorization_rules()
     fastapi_app = create_fastapi_app(app)

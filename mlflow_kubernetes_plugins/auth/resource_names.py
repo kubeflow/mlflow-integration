@@ -307,6 +307,28 @@ def _resolve_experiment_name_from_experiment_id(experiment_id: str) -> str:
     return experiment_name
 
 
+def resolve_experiment_ids_from_names(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve already-authorized names using workspace-scoped exact lookups."""
+    store = _get_tracking_store()
+    experiment_ids: list[str] = []
+    for name in names:
+        try:
+            experiment = store.get_experiment_by_name(name)
+        except MlflowException as exc:
+            raise ResourceNameResolutionError(
+                f"Could not resolve experiment named '{name}'."
+            ) from exc
+        if experiment is None:
+            continue
+        if getattr(experiment, "name", None) != name:
+            raise ResourceNameResolutionError("Experiment name lookup returned a different name.")
+        experiment_id = _normalize_string(getattr(experiment, "experiment_id", None))
+        if experiment_id is None:
+            raise ResourceNameResolutionError("Experiment name lookup returned no ID.")
+        experiment_ids.append(experiment_id)
+    return tuple(dict.fromkeys(experiment_ids))
+
+
 def _resolve_experiment_name_from_run_id(run_id: str) -> str:
     if cached_experiment_id := _run_experiment_name_cache.get(run_id):
         return _resolve_experiment_name_from_experiment_id(cached_experiment_id)

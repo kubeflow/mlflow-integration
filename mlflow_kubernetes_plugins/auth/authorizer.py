@@ -9,7 +9,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, NamedTuple
+from typing import TYPE_CHECKING, Generic, Iterable, TypeVar
 
 from kubernetes import client, config
 from kubernetes.client import AuthorizationV1Api
@@ -17,6 +17,7 @@ from kubernetes.client.exceptions import ApiException
 from kubernetes.config.config_exception import ConfigException
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
+from urllib3 import HTTPHeaderDict
 
 from mlflow_kubernetes_plugins.auth.constants import (
     AUTHORIZATION_MODE_ENV,
@@ -46,6 +47,12 @@ _logger = logging.getLogger(__name__)
 class AuthorizationMode(str, Enum):
     SELF_SUBJECT_ACCESS_REVIEW = "self_subject_access_review"
     SUBJECT_ACCESS_REVIEW = "subject_access_review"
+
+
+@dataclass(frozen=True)
+class CollectionScope:
+    broad: bool = False
+    names: tuple[str, ...] = ()
 
 
 def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
@@ -99,9 +106,8 @@ class _ReadWriteLock:
             self._condition.notify_all()
 
 
-class _CacheEntry(NamedTuple):
-    allowed: bool
-    expires_at: float
+_CacheKey = TypeVar("_CacheKey")
+_CacheValue = TypeVar("_CacheValue")
 
 
 @dataclass(frozen=True)
@@ -126,14 +132,14 @@ def _effective_resource_name_for_access_review(
     return resource_name
 
 
-class _AuthorizationCache:
+class _ExpiringCache(Generic[_CacheKey, _CacheValue]):
     def __init__(self, ttl_seconds: float, max_entries: int = 10_000) -> None:
         self._ttl_seconds = ttl_seconds
         self._max_entries = max_entries
-        self._entries: OrderedDict[_AuthorizationCacheKey, _CacheEntry] = OrderedDict()
+        self._entries: OrderedDict[_CacheKey, tuple[_CacheValue, float]] = OrderedDict()
         self._lock = _ReadWriteLock()
 
-    def get(self, key: _AuthorizationCacheKey) -> bool | None:
+    def get(self, key: _CacheKey) -> _CacheValue | None:
         observed_expiration: float | None = None
 
         self._lock.acquire_read()
@@ -141,9 +147,10 @@ class _AuthorizationCache:
             entry = self._entries.get(key)
             if entry is None:
                 return None
-            if entry.expires_at > time.time():
-                return entry.allowed
-            observed_expiration = entry.expires_at
+            value, expires_at = entry
+            if expires_at > time.time():
+                return value
+            observed_expiration = expires_at
         finally:
             self._lock.release_read()
 
@@ -151,29 +158,32 @@ class _AuthorizationCache:
         try:
             current = self._entries.get(key)
             if current is not None:
-                if observed_expiration is None or current.expires_at <= observed_expiration:
+                _, current_expiration = current
+                if observed_expiration is None or current_expiration <= observed_expiration:
                     self._entries.pop(key, None)
         finally:
             self._lock.release_write()
         return None
 
-    def set(self, key: _AuthorizationCacheKey, allowed: bool) -> None:
+    def set(self, key: _CacheKey, value: _CacheValue) -> None:
         self._lock.acquire_write()
         try:
             now = time.time()
             expired_keys = [
-                existing_key
-                for existing_key, entry in self._entries.items()
-                if entry.expires_at <= now
+                existing_key for existing_key, entry in self._entries.items() if entry[1] <= now
             ]
             for existing_key in expired_keys:
                 self._entries.pop(existing_key, None)
             self._entries.pop(key, None)
             while len(self._entries) >= self._max_entries:
                 self._entries.popitem(last=False)
-            self._entries[key] = _CacheEntry(allowed=allowed, expires_at=now + self._ttl_seconds)
+            self._entries[key] = (value, now + self._ttl_seconds)
         finally:
             self._lock.release_write()
+
+
+_AuthorizationCache = _ExpiringCache[_AuthorizationCacheKey, bool]
+_RulesReviewCache = _ExpiringCache[tuple[str, str, str], tuple[object, ...]]
 
 
 def _load_kubernetes_configuration() -> client.Configuration:
@@ -202,6 +212,39 @@ def _create_api_client_for_subject_access_reviews() -> client.ApiClient:
     return client.ApiClient()
 
 
+class _ImpersonatingApiClient(client.ApiClient):
+    """Preserve repeated Impersonate-Group headers through the generated API client."""
+
+    def __init__(self, configuration: client.Configuration, groups: tuple[str, ...]) -> None:
+        super().__init__(configuration)
+        self._impersonated_groups = groups
+
+    def request(
+        self,
+        method,
+        url,
+        query_params=None,
+        headers=None,
+        post_params=None,
+        body=None,
+        _preload_content=True,
+        _request_timeout=None,
+    ):
+        impersonation_headers = HTTPHeaderDict(headers or {})
+        for group in self._impersonated_groups:
+            impersonation_headers.add("Impersonate-Group", group)
+        return super().request(
+            method,
+            url,
+            query_params=query_params,
+            headers=impersonation_headers,
+            post_params=post_params,
+            body=body,
+            _preload_content=_preload_content,
+            _request_timeout=_request_timeout,
+        )
+
+
 class KubernetesAuthorizer:
     def __init__(
         self,
@@ -210,6 +253,7 @@ class KubernetesAuthorizer:
     ) -> None:
         self._group = group
         self._cache = _AuthorizationCache(config_values.cache_ttl_seconds)
+        self._rules_cache = _RulesReviewCache(config_values.cache_ttl_seconds)
         self._mode = config_values.authorization_mode
         self._base_configuration: client.Configuration | None = None
         self._sar_api_client: client.ApiClient | None = None
@@ -305,6 +349,121 @@ class KubernetesAuthorizer:
                 error_code=databricks_pb2.INTERNAL_ERROR,
             )
         return bool(allowed)
+
+    def _submit_self_subject_rules_review(self, token: str, namespace: str):
+        body = client.V1SelfSubjectRulesReview(
+            spec=client.V1SelfSubjectRulesReviewSpec(namespace=namespace)
+        )
+        api_client = self._build_api_client_with_token(token)
+        try:
+            return AuthorizationV1Api(api_client).create_self_subject_rules_review(body)
+        finally:
+            api_client.close()
+
+    def _submit_impersonated_subject_rules_review(
+        self, user: str, groups: tuple[str, ...], namespace: str
+    ):
+        if not user or any("\r" in value or "\n" in value for value in (user, *groups)):
+            raise MlflowException(
+                "Invalid forwarded identity for Kubernetes rules review.",
+                error_code=databricks_pb2.PERMISSION_DENIED,
+            )
+        if self._sar_api_client is None:
+            raise MlflowException(
+                "SubjectAccessReview mode requires a Kubernetes client.",
+                error_code=databricks_pb2.INTERNAL_ERROR,
+            )
+        body = client.V1SelfSubjectRulesReview(
+            spec=client.V1SelfSubjectRulesReviewSpec(namespace=namespace)
+        )
+        api_client = _ImpersonatingApiClient(self._sar_api_client.configuration, groups)
+        try:
+            return AuthorizationV1Api(api_client).create_self_subject_rules_review(
+                body, _headers={"Impersonate-User": user}
+            )
+        finally:
+            api_client.close()
+
+    def discover_collection_scope(
+        self,
+        identity: "_RequestIdentity",
+        resource_type: str,
+        namespace: str,
+        subresource: str | None = None,
+    ) -> CollectionScope:
+        """Discover named get grants after an unscoped list review was denied.
+
+        SSRR is only a source of candidate names. Confirm every candidate with an
+        access review before it can constrain an MLflow query.
+        """
+        resource = resource_type.replace("_", "")
+        requested_resource = f"{resource}/{subresource}" if subresource else resource
+        cache_key = (
+            self._mode.value,
+            identity.subject_hash(self._mode, missing_user_label=self._user_header_label),
+            namespace,
+        )
+        resource_rules = self._rules_cache.get(cache_key)
+        if resource_rules is None:
+            try:
+                if self._mode == AuthorizationMode.SELF_SUBJECT_ACCESS_REVIEW:
+                    review = self._submit_self_subject_rules_review(identity.token or "", namespace)
+                else:
+                    review = self._submit_impersonated_subject_rules_review(
+                        identity.user or "", identity.groups, namespace
+                    )
+            except ApiException as exc:  # pragma: no cover - depends on live cluster
+                raise MlflowException(
+                    "Failed to discover Kubernetes collection permissions.",
+                    error_code=databricks_pb2.PERMISSION_DENIED,
+                ) from exc
+
+            status = getattr(review, "status", None)
+            if (
+                status is None
+                or getattr(status, "evaluation_error", None)
+                or getattr(status, "incomplete", False)
+            ):
+                raise MlflowException(
+                    "Kubernetes collection permissions could not be evaluated.",
+                    error_code=databricks_pb2.PERMISSION_DENIED,
+                )
+            resource_rules = tuple(getattr(status, "resource_rules", None) or ())
+            self._rules_cache.set(cache_key, resource_rules)
+
+        candidate_names: set[str] = set()
+        for rule in resource_rules:
+            groups = getattr(rule, "api_groups", None) or ()
+            resources = getattr(rule, "resources", None) or ()
+            verbs = getattr(rule, "verbs", None) or ()
+            if self._group not in groups and "*" not in groups:
+                continue
+            if requested_resource not in resources and "*" not in resources:
+                continue
+            if "get" not in verbs and "list" not in verbs and "*" not in verbs:
+                continue
+
+            rule_names = getattr(rule, "resource_names", None) or ()
+            if "*" in rule_names:
+                return CollectionScope(broad=True)
+            if "get" in verbs or "*" in verbs:
+                candidate_names.update(
+                    name for name in rule_names if isinstance(name, str) and name
+                )
+
+        verified_names = tuple(
+            name
+            for name in sorted(candidate_names)
+            if self.is_allowed(
+                identity,
+                resource_type,
+                "get",
+                namespace,
+                subresource,
+                resource_name=name,
+            )
+        )
+        return CollectionScope(names=verified_names)
 
     def _submit_subject_access_review(
         self,
