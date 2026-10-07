@@ -43,6 +43,14 @@ uv sync --extra dev
 For Kubernetes deployment, see the
 [`charts/mlflow` installation guide](charts/mlflow/README.md).
 
+Build a container image from the current plugin source with `make image-build`,
+then check its installed versions and auth initialization with `make image-verify`.
+The build stage packages the checkout into a wheel; the runtime stage installs
+that wheel without copying the source checkout into the final image.
+MLflow is pinned in `Dockerfile`; the plugin version comes from `pyproject.toml`.
+Image builds do not require the plugin to be published on PyPI. CI verifies the
+amd64 image before publishing the multi-architecture image.
+
 ## Quick Start
 
 1. Enable MLflow workspaces on an MLflow server backed by a SQL store.

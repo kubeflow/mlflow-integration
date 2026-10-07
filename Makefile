@@ -4,6 +4,8 @@ SHELL = /usr/bin/env bash -o pipefail
 IMG ?= mlflow-integration
 UV_RUN ?= uv run
 CONTAINER_TOOL ?= docker
+IMAGE_PLATFORM ?=
+MLFLOW_VERSION ?= $(shell sed -n 's/^ARG MLFLOW_VERSION=//p' Dockerfile)
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
 GENERATED_FILES = api/mlflowconfig/v1/zz_generated.deepcopy.go config/crd/bases/mlflow.kubeflow.org_mlflowconfigs.yaml
@@ -31,6 +33,13 @@ python-build: ## Build Python distribution artifacts.
 .PHONY: image-build
 image-build: ## Build the container image.
 	$(CONTAINER_TOOL) build -t $(IMG) .
+
+.PHONY: image-verify
+image-verify: ## Verify installed versions and auth startup in an existing image, offline.
+	tar -cf - pyproject.toml hack/verify-image.py | \
+		$(CONTAINER_TOOL) run --rm -i --network none \
+		$(if $(IMAGE_PLATFORM),--platform $(IMAGE_PLATFORM)) --entrypoint sh "$(IMG)" \
+		-c 'cd /tmp && tar --no-same-owner -xf - && python -I hack/verify-image.py pyproject.toml "$(MLFLOW_VERSION)"'
 
 .PHONY: generate-deepcopy
 generate-deepcopy: ## Generate deepcopy implementations for Go API types.
