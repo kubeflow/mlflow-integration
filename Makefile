@@ -24,6 +24,10 @@ python-typecheck: ## Run Python type checker.
 python-test: ## Run Python test suite.
 	@$(UV_RUN) pytest -v
 
+.PHONY: kind-e2e
+kind-e2e: ## Build the image and run live MLflow tests on a disposable Kind cluster.
+	@./hack/kind-e2e.sh
+
 .PHONY: python-build
 python-build: ## Build Python distribution artifacts.
 	@uv build
