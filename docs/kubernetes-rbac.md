@@ -69,11 +69,22 @@ This is most useful for single-object operations such as:
 - creating or updating model versions, webhooks, and many gateway resources by name
 - reading artifacts or trace details that resolve back to one experiment
 
-Collection endpoints behave differently:
+Collection searches first check broad `list` permission in the workspace. An
+explicit `resourceNames: ["*"]` grant on `get` or `list` is a plugin-level
+compatibility convention and also permits the original query; Kubernetes RBAC
+does not interpret that name as a wildcard itself. Otherwise, the plugin
+discovers concrete named `get` grants through Kubernetes
+SelfSubjectRulesReview, validates each name with an access review, and narrows
+the request before MLflow queries storage. The caller's own search filter is
+combined with the authorization scope. If the installed MLflow version cannot
+enforce that scope, the plugin denies the request before dispatch.
 
-- many search and list endpoints now filter request inputs or response items down to the readable experiments
-- MCP registry collection responses filter server and binding items down to the readable MCP servers
-- some endpoints still require broader `list` access and may return `Permission denied` for callers that only have named resources
+This applies to experiment, evaluation-dataset, trace, registered-model,
+model-version, MCP server, and MCP access-endpoint searches; batch trace reads;
+scorer listing; and GraphQL model-version search. REST and AJAX variants use the
+same rules. Collection responses are not filtered or backfilled after the query.
+Other collection endpoints that already narrow explicit request IDs retain their
+request-side authorization behavior.
 
 Use the example manifest below as a starting point for both broad workspace access and name-scoped experiment access:
 
@@ -111,9 +122,48 @@ on skills. Direct parent creation requires broad `create`.
 
 When `MLFLOW_K8S_AUTH_AUTHORIZATION_MODE=subject_access_review`, the MLflow server must also be allowed to create `subjectaccessreviews.authorization.k8s.io`.
 
-That permission is included in:
+That permission is included in [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml).
 
-- [`examples/mlflow-server-rbac.yaml`](../examples/mlflow-server-rbac.yaml)
+Named collection scopes are enabled by default in trusted-proxy mode. When a
+caller lacks broad collection permission, MLflow impersonates the forwarded user
+and groups only to create a `SelfSubjectRulesReview` (SSRR). SSRR supplies candidate
+resource names; MLflow confirms each name with a SubjectAccessReview before
+narrowing the collection request.
+
+The server ClusterRole in the example manifest and
+[Helm chart](../charts/mlflow/templates/rbac.yaml) includes:
+
+```yaml
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["users", "groups"]
+  verbs: ["impersonate:user-info"]
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["selfsubjectrulesreviews"]
+  verbs: ["impersonate-on:user-info:create"]
+```
+
+This requires Kubernetes 1.35 with the `ConstrainedImpersonation` feature gate
+enabled, or Kubernetes 1.36+, where it is enabled by default. See
+[Kubernetes constrained impersonation](https://kubernetes.io/docs/reference/access-authn-authz/user-impersonation/#constrained-impersonation).
+If the feature is disabled, unavailable, or denied by RBAC, requests requiring
+named-scope discovery are denied before querying MLflow storage. Broadly
+authorized collection requests continue to work without SSRR. Set
+`MLFLOW_K8S_AUTH_SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED=false` to explicitly
+disable discovery in SAR mode.
+
+Do not also grant traditional `impersonate` permission: Kubernetes can fall back
+to it, allowing operations beyond SSRR. Administrators can restrict permitted
+identities by splitting the `users` and `groups` identity rule into separate rules
+and adding `resourceNames` containing the allowed usernames and group names to
+each rule. Every forwarded group must be permitted.
+
+These rules cover ordinary users. Forwarded `system:serviceaccount:` and
+`system:node:` identities require separate constrained impersonation modes and
+are not granted discovery by these rules. Their directly authorized operations
+and broadly authorized collection requests continue to work.
+
+The proxy must authenticate callers and strip client-supplied identity headers
+before setting the forwarded user and groups.
 
 ## Token Creation
 

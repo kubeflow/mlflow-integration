@@ -235,7 +235,7 @@ def _find_authorization_rules(
             payload = graphql_payload or {}
 
             query_string = payload.get("query", "")
-            if not query_string:
+            if not isinstance(query_string, str) or not query_string:
                 core_mod._logger.error(
                     "Could not determine GraphQL authorization: no query provided."
                 )

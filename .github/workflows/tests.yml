@@ -80,19 +80,25 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     needs: pre-commit
-    name: lint-and-test (${{ matrix.python-version }}, mlflow ${{ matrix.mlflow.name }})
+    name: lint-and-test (${{ matrix.python-version }}, mlflow ${{ matrix.mlflow-version }}, kubernetes ${{ matrix.kubernetes-version }})
     env:
       UV_RUN: uv run --no-sync
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
-        mlflow:
-          - name: "3.17"
-            requirement: "mlflow~=3.17.0"
+        mlflow-version: ["3.17", "f566a42"]
+        kubernetes-version: [">=29.0.0"]
+        include:
+          - mlflow-version: "3.17"
+            mlflow-requirement: "mlflow~=3.17.0"
           # Skill registry support: replace this commit with released MLflow 3.18.
-          - name: "f566a42"
-            requirement: "mlflow @ git+https://github.com/mlflow/mlflow.git@f566a42d64fce8997fe187edb5229221ace09713"
+          - mlflow-version: "f566a42"
+            mlflow-requirement: "mlflow @ git+https://github.com/mlflow/mlflow.git@f566a42d64fce8997fe187edb5229221ace09713"
+          - python-version: "3.12"
+            mlflow-version: "3.17"
+            kubernetes-version: "==29.0.0"
+            mlflow-requirement: "mlflow~=3.17.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -102,10 +108,10 @@ jobs:
 
       - name: Install dependencies
         env:
-          MLFLOW_REQUIREMENT: ${{ matrix.mlflow.requirement }}
+          MLFLOW_REQUIREMENT: ${{ matrix.mlflow-requirement }}
         run: |
           uv venv
-          uv pip install -e ".[dev]" "$MLFLOW_REQUIREMENT"
+          uv pip install -e ".[dev]" "$MLFLOW_REQUIREMENT" "kubernetes${{ matrix.kubernetes-version }}"
 
       - name: Lint
         run: make python-lint

@@ -35,6 +35,7 @@ mlflow server \
 | --- | --- | --- |
 | `MLFLOW_K8S_AUTH_CACHE_TTL_SECONDS` | `300` | TTL for cached authorization decisions. |
 | `MLFLOW_K8S_AUTH_USERNAME_CLAIM` | `sub` | JWT claim used for the MLflow run owner. |
+| `MLFLOW_K8S_AUTH_SAR_COLLECTION_SCOPE_DISCOVERY_ENABLED` | `true` | Enables named collection scope discovery in SAR mode; requires constrained impersonation RBAC. |
 | `MLFLOW_K8S_AUTH_AUTHORIZATION_MODE` | `self_subject_access_review` | Selects direct-token or trusted-proxy authorization mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_USER_HEADER` | `x-remote-user` | Username header used in trusted-proxy mode. |
 | `MLFLOW_K8S_AUTH_REMOTE_GROUPS_HEADER` | `x-remote-groups` | Groups header used in trusted-proxy mode. |
@@ -66,6 +67,9 @@ export MLFLOW_K8S_AUTH_REMOTE_GROUPS_SEPARATOR="|"
 ```
 
 Use this mode only behind a trusted proxy such as `kube-rbac-proxy` that authenticates callers before forwarding requests to MLflow.
+
+Named collection scope discovery is enabled by default and requires constrained
+impersonation. See [trusted-proxy RBAC and cluster requirements](kubernetes-rbac.md#trusted-proxy-mode).
 
 ## Single-Namespace Mode
 
@@ -111,7 +115,7 @@ plugin uses the configured namespace instead.
 - workspace listings are filtered by the caller's visible namespaces
 - GraphQL and FastAPI routes are covered in addition to the classic Flask endpoints
 - MCP registry FastAPI routes are authorized through the `mcpservers` pseudo-resource, and
-  MCP server and binding collection responses are filtered to the caller's readable servers
+  MCP server and access-endpoint collection requests are narrowed to the caller's readable servers
 - GraphQL collection fields use server-side filtering, while single-object GraphQL reads keep explicit request-time authorization
 - gateway resource access uses `use` subresources for fine-grained RBAC checks
 - gateway guardrails use the dedicated `gatewayguardrails` resource but remain workspace-scoped

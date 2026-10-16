@@ -47,6 +47,12 @@ See [`values.yaml`](values.yaml) for all configuration options and `ci/` for
 standalone, multi-user, and optional-workload examples. For production,
 provide remote backend and artifact stores through a custom values file.
 
+For trusted-proxy authorization, named collection scope discovery requires
+Kubernetes constrained impersonation: Kubernetes 1.35 with the feature enabled,
+or 1.36+ with its default feature setting. The chart includes the constrained
+RBAC rules. See [trusted-proxy requirements](../../docs/kubernetes-rbac.md#trusted-proxy-mode)
+for identity restrictions, opt-out configuration, and behavior when unavailable.
+
 ## Uninstalling
 
 ```bash

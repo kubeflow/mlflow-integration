@@ -198,18 +198,20 @@ from mlflow.tracing.utils.otlp import OTLP_TRACES_PATH
 
 from mlflow_kubernetes_plugins.auth.collection_filters import (
     COLLECTION_POLICY_BROAD_ONLY,
+    COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
+    COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_ID,
     COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
+    COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     COLLECTION_POLICY_REQUEST_RUN_IDS,
+    COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
+    COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
+    COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
+    COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS,
-    COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
-    COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
-    COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
-    COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
-    COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
-    COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
-    COLLECTION_POLICY_RESPONSE_SCORERS,
-    COLLECTION_POLICY_RESPONSE_TRACES,
 )
 from mlflow_kubernetes_plugins.auth.constants import (
     WORKSPACE_MUTATION_DENIED_MESSAGE,
@@ -348,7 +350,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ),
     SearchExperiments: _experiments_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_EXPERIMENTS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_EXPERIMENTS,
     ),
     # Datasets
     AddDatasetToExperiments: (
@@ -572,10 +574,8 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
         resource_name_parsers=(RESOURCE_NAME_PARSER_MODEL_ID_TO_EXPERIMENT_NAME,),
     ),
     ListScorers: _experiments_rule(
-        "get",
-        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
-        collection_policy=COLLECTION_POLICY_RESPONSE_SCORERS,
-        fallback_to_collection_policy_on_missing_resource_reference=True,
+        "list",
+        collection_policy=COLLECTION_POLICY_REQUEST_LIST_SCORERS,
     ),
     GetScorer: _experiments_rule(
         "get",
@@ -620,7 +620,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ),
     SearchEvaluationDatasets: _datasets_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_DATASET_SUMMARIES,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_DATASETS,
     ),
     # Experiment child resources (multi-experiment reads)
     SearchLoggedModels: _experiments_rule(
@@ -629,7 +629,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ),
     BatchGetTraces: _experiments_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_TRACES,
+        collection_policy=COLLECTION_POLICY_REQUEST_BATCH_GET_TRACES,
     ),
     CalculateTraceFilterCorrelation: _experiments_rule(
         "list",
@@ -639,7 +639,9 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
         "list",
         collection_policy=COLLECTION_POLICY_REQUEST_EXPERIMENT_IDS,
     ),
-    SearchTraces: _experiments_rule("list", collection_policy=COLLECTION_POLICY_RESPONSE_TRACES),
+    SearchTraces: _experiments_rule(
+        "list", collection_policy=COLLECTION_POLICY_REQUEST_AUTHORIZED_EXPERIMENT_IDS
+    ),
     SearchTracesV3: _experiments_rule(
         "list",
         collection_policy=COLLECTION_POLICY_REQUEST_TRACE_LOCATIONS,
@@ -675,7 +677,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ),
     SearchRegisteredModels: _registered_models_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_REGISTERED_MODELS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_REGISTERED_MODELS,
     ),
     CreateModelVersion: _registered_models_rule(
         "update",
@@ -881,7 +883,7 @@ BASE_REQUEST_AUTHORIZATION_RULES: dict[type, AuthorizationRule | tuple[Authoriza
     ),
     BatchGetTraceInfos: _experiments_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_TRACES,
+        collection_policy=COLLECTION_POLICY_REQUEST_BATCH_GET_TRACE_INFOS,
     ),
     GetPresignedDownloadUrl: _experiments_rule(
         "get",
@@ -983,11 +985,11 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
     ("/server-info", "GET"): AuthorizationRule(None),
     ("/api/2.0/mlflow/model-versions/search", "GET"): _registered_models_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
     ),
     ("/ajax-api/2.0/mlflow/model-versions/search", "GET"): _registered_models_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MODEL_VERSIONS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MODEL_VERSIONS,
     ),
     ("/graphql", "GET"): _experiments_rule("get"),
     ("/graphql", "POST"): _experiments_rule("get"),
@@ -1223,11 +1225,11 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
     ("/ajax-api/3.0/mlflow/mcp-servers", "POST"): _mcp_servers_rule("create"),
     ("/ajax-api/3.0/mlflow/mcp-servers", "GET"): _mcp_servers_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
     ),
     ("/ajax-api/3.0/mlflow/mcp-servers/endpoints", "GET"): _mcp_servers_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
     ),
     ("/ajax-api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"): _mcp_servers_rule(
         "update",
@@ -1340,11 +1342,11 @@ BASE_PATH_AUTHORIZATION_RULES: dict[
     ("/api/3.0/mlflow/mcp-servers", "POST"): _mcp_servers_rule("create"),
     ("/api/3.0/mlflow/mcp-servers", "GET"): _mcp_servers_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_SERVERS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_SERVERS,
     ),
     ("/api/3.0/mlflow/mcp-servers/endpoints", "GET"): _mcp_servers_rule(
         "list",
-        collection_policy=COLLECTION_POLICY_RESPONSE_MCP_ACCESS_ENDPOINTS,
+        collection_policy=COLLECTION_POLICY_REQUEST_SEARCH_MCP_ACCESS_ENDPOINTS,
     ),
     ("/api/3.0/mlflow/mcp-servers/<path:name>/versions", "POST"): _mcp_servers_rule(
         "update",

@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -6,7 +7,7 @@ import pytest
 from flask import Flask
 from mlflow.exceptions import MlflowException
 from mlflow.protos.service_pb2 import CreateRun
-from mlflow_kubernetes_plugins.auth.authorizer import KubernetesAuthConfig
+from mlflow_kubernetes_plugins.auth.authorizer import CollectionScope, KubernetesAuthConfig
 from mlflow_kubernetes_plugins.auth.collection_filters import COLLECTION_POLICY_GRAPHQL_FILTER
 from mlflow_kubernetes_plugins.auth.compiler import _find_authorization_rules
 from mlflow_kubernetes_plugins.auth.core import (
@@ -17,7 +18,7 @@ from mlflow_kubernetes_plugins.auth.core import (
 from mlflow_kubernetes_plugins.auth.graphql import (
     GRAPHQL_FIELD_AUTH_POLICY_MAP,
     GRAPHQL_FIELD_AUTH_POLICY_REQUEST_FILTER,
-    GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER,
+    GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE,
     GRAPHQL_FIELD_AUTH_POLICY_SINGLE_OBJECT,
     GRAPHQL_FIELD_RESOURCE_MAP,
     GRAPHQL_FIELD_VERB_MAP,
@@ -105,7 +106,7 @@ def test_graphql_field_maps_are_consistent():
     )
     assert (
         GRAPHQL_FIELD_AUTH_POLICY_MAP["mlflowSearchModelVersions"]
-        == GRAPHQL_FIELD_AUTH_POLICY_RESPONSE_FILTER
+        == GRAPHQL_FIELD_AUTH_POLICY_REQUEST_SCOPE
     )
 
 
@@ -517,7 +518,7 @@ def test_graphql_query_parsing_mixed_query():
     rules = _find_authorization_rules("/graphql", "POST", graphql_payload={"query": query})
     # Mixed queries return 2 rules:
     # - experiments:get (from mlflowGetExperiment)
-    # - registeredmodels:list (from mlflowSearchModelVersions, filtered at response time)
+    # - registeredmodels:list (from mlflowSearchModelVersions, scoped before resolution)
     assert rules is not None
     assert len(rules) == 2
     resources = {r.resource for r in rules}
@@ -543,7 +544,7 @@ def test_graphql_operation_name_does_not_bypass_query_parsing():
     assert RESOURCE_REGISTERED_MODELS in resources
 
 
-def test_authorize_request_graphql_search_model_versions_defers_to_response_filter(monkeypatch):
+def test_authorize_request_graphql_search_model_versions_defers_named_scope(monkeypatch):
     authorizer = Mock()
     authorizer.is_allowed.return_value = False
     monkeypatch.setattr(
@@ -567,11 +568,7 @@ def test_authorize_request_graphql_search_model_versions_defers_to_response_filt
         authorizer=authorizer,
         config_values=KubernetesAuthConfig(),
     )
-
-    assert len(result.rules) == 1
-    assert result.rules[0].resource == RESOURCE_REGISTERED_MODELS
-    assert result.rules[0].verb == "list"
-    assert result.rules[0].collection_policy == COLLECTION_POLICY_GRAPHQL_FILTER
+    assert result.request_context.path == "/graphql"
     assert authorizer.is_allowed.call_count == 1
 
 
@@ -1026,31 +1023,86 @@ def test_kubernetes_graphql_middleware_filters_search_runs_dict_input(monkeypatc
     assert result == ["1"]
 
 
-def test_kubernetes_graphql_middleware_filters_model_versions_response():
+def test_kubernetes_graphql_middleware_scopes_model_version_filter():
     app = Flask(__name__)
     authorizer = Mock()
-    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
-        kwargs.get("resource_name") == "model-a"
-    )
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
     middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
     result_obj = SimpleNamespace(
         model_versions=[SimpleNamespace(name="model-a"), SimpleNamespace(name="model-b")]
     )
+    input_obj = SimpleNamespace(filter="name ILIKE 'model%'")
+    resolver = Mock(return_value=result_obj)
 
     with app.test_request_context("/graphql"):
         token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
         try:
             info = SimpleNamespace(field_name="mlflowSearchModelVersions")
-            filtered = middleware.resolve(
-                lambda _root, _info, **_kwargs: result_obj,
+            result = middleware.resolve(resolver, None, info, input=input_obj)
+        finally:
+            _AUTHORIZATION_HANDLED.reset(token)
+
+    assert result is result_obj
+    assert input_obj.filter == "name ILIKE 'model%' AND name = 'model-a'"
+    resolver.assert_called_once()
+    assert resolver.call_args.kwargs["input"] is input_obj
+
+
+def test_kubernetes_graphql_model_search_denies_without_named_scope():
+    app = Flask(__name__)
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope()
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
+    resolver = Mock()
+
+    with app.test_request_context("/graphql"):
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+        try:
+            result = middleware.resolve(
+                resolver,
                 None,
-                info,
-                input=SimpleNamespace(filter=""),
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": ""},
             )
         finally:
             _AUTHORIZATION_HANDLED.reset(token)
 
-    assert [model.name for model in filtered.model_versions] == ["model-a"]
+    assert result is None
+    resolver.assert_not_called()
+    authorizer.discover_collection_scope.assert_called_once()
+
+
+def test_kubernetes_graphql_model_search_preserves_each_alias():
+    app = Flask(__name__)
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    middleware = KubernetesGraphQLAuthorizationMiddleware(authorizer)
+    resolver = Mock(side_effect=lambda _root, _info, **kwargs: kwargs["input"]["filter"])
+
+    with app.test_request_context("/graphql"):
+        token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+        try:
+            first = middleware.resolve(
+                resolver,
+                None,
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": "name ILIKE 'a%'"},
+            )
+            second = middleware.resolve(
+                resolver,
+                None,
+                SimpleNamespace(field_name="mlflowSearchModelVersions"),
+                input={"filter": "name ILIKE 'b%'"},
+            )
+        finally:
+            _AUTHORIZATION_HANDLED.reset(token)
+
+    assert first == "name ILIKE 'a%' AND name = 'model-a'"
+    assert second == "name ILIKE 'b%' AND name = 'model-a'"
+    assert resolver.call_count == 2
 
 
 def test_kubernetes_graphql_middleware_tolerates_missing_request_context():
@@ -1222,3 +1274,222 @@ def test_graphql_query_with_unknown_fields_returns_none():
     query = "{ unknownField { data } }"
     rules = _find_authorization_rules("/graphql", "POST", graphql_payload={"query": query})
     assert rules is None
+
+
+@pytest.mark.parametrize(
+    "query,variables,expected",
+    [
+        (
+            '{ mlflowSearchModelVersions(input: {filter: ""}) {modelVersions {name}} }',
+            None,
+            {"mlflowSearchModelVersions": ["model-a"]},
+        ),
+        (
+            "{ mlflowSearchModelVersions(input: {}) {modelVersions {name}} }",
+            None,
+            {"mlflowSearchModelVersions": ["model-a"]},
+        ),
+        (
+            "{ mlflowSearchModelVersions(input: {filter: null}) {modelVersions {name}} }",
+            None,
+            {"mlflowSearchModelVersions": ["model-a"]},
+        ),
+        (
+            """query($search: MlflowSearchModelVersionsInput) {
+                mlflowSearchModelVersions(input: $search) {modelVersions {name}}
+            }""",
+            {"search": {"filter": "name IN ('model-a', 'model-b')"}},
+            {"mlflowSearchModelVersions": ["model-a"]},
+        ),
+        (
+            """{
+                allowed: mlflowSearchModelVersions(input: {filter: "name = 'model-a'"}) {
+                    modelVersions {name}
+                }
+                forbidden: mlflowSearchModelVersions(input: {filter: "name = 'model-b'"}) {
+                    modelVersions {name}
+                }
+            }""",
+            None,
+            {"allowed": ["model-a"], "forbidden": []},
+        ),
+    ],
+    ids=["empty-filter", "empty-input", "null-filter", "variables", "aliases"],
+)
+def test_graphql_model_version_scope_reaches_real_resolver_and_store(
+    tmp_path, monkeypatch, query, variables, expected
+):
+    from mlflow.server.graphql.graphql_schema_extensions import schema
+    from mlflow.tracking import MlflowClient
+
+    uri = f"sqlite:///{tmp_path}/registry.db"
+    client = MlflowClient(tracking_uri=uri, registry_uri=uri)
+    for name in ("model-a", "model-b"):
+        client.create_registered_model(name)
+        client.create_model_version(name, source=str(tmp_path / "model"))
+    monkeypatch.setattr(
+        "mlflow.server.handlers._get_model_registry_store",
+        lambda: client._get_registry_client().store,
+    )
+    authorizer = Mock()
+    authorizer.is_allowed.return_value = False
+    authorizer.discover_collection_scope.return_value = CollectionScope(names=("model-a",))
+    token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+    try:
+        result = schema.execute(
+            query,
+            variable_values=variables,
+            middleware=[KubernetesGraphQLAuthorizationMiddleware(authorizer)],
+        )
+    finally:
+        _AUTHORIZATION_HANDLED.reset(token)
+    assert result.errors is None
+    assert {
+        key: [row["name"] for row in value["modelVersions"]] for key, value in result.data.items()
+    } == expected
+
+
+@pytest.fixture(scope="module")
+def graphql_experiment_store(tmp_path_factory):
+    from mlflow.entities import Dataset, DatasetInput
+    from mlflow.tracking import MlflowClient
+
+    root = tmp_path_factory.mktemp("graphql-experiment-search")
+    uri = f"sqlite:///{root}/tracking.db"
+    client = MlflowClient(tracking_uri=uri, registry_uri=uri)
+    experiments = {}
+    for name in ("allowed-a", "allowed-b", "forbidden"):
+        experiment_id = client.create_experiment(name, artifact_location=str(root / name))
+        experiments[name] = experiment_id
+        run = client.create_run(experiment_id)
+        client.log_inputs(run.info.run_id, [DatasetInput(Dataset(name, "digest", "test", "{}"))])
+    return SimpleNamespace(store=client._tracking_client.store, experiments=experiments)
+
+
+@pytest.fixture
+def graphql_experiment_search(graphql_experiment_store, monkeypatch):
+    from mlflow.server.graphql.graphql_schema_extensions import schema
+
+    store = graphql_experiment_store.store
+    monkeypatch.setattr("mlflow.server.handlers._get_tracking_store", lambda: store)
+    monkeypatch.setattr(resource_names_mod, "_get_tracking_store", lambda: store)
+    resource_names_mod._experiment_name_cache.clear()
+    authorizer = Mock()
+    authorizer.is_allowed.side_effect = lambda *args, **kwargs: (
+        kwargs.get("resource_name") in ("allowed-a", "allowed-b")
+    )
+    app = Flask(__name__)
+
+    def execute(query, variables=None):
+        with app.test_request_context("/graphql", method="POST", json={}):
+            token = _AUTHORIZATION_HANDLED.set(_graphql_auth_result())
+            try:
+                result = schema.execute(
+                    query,
+                    variable_values=variables,
+                    middleware=[KubernetesGraphQLAuthorizationMiddleware(authorizer)],
+                )
+            finally:
+                _AUTHORIZATION_HANDLED.reset(token)
+        assert result.errors is None
+        return result.data
+
+    yield SimpleNamespace(
+        execute=execute,
+        authorizer=authorizer,
+        experiments=graphql_experiment_store.experiments,
+    )
+    resource_names_mod._experiment_name_cache.clear()
+
+
+@pytest.mark.parametrize(
+    "field,operation",
+    [
+        ("mlflowSearchRuns", "query"),
+        ("mlflowSearchRuns", "mutation"),
+        ("mlflowSearchDatasets", "mutation"),
+    ],
+)
+@pytest.mark.parametrize("use_variables", [False, True])
+@pytest.mark.parametrize(
+    "access,names,expected",
+    [
+        ("named", ["allowed-a", "forbidden"], ["allowed-a"]),
+        ("named", ["allowed-a", "allowed-b"], ["allowed-a", "allowed-b"]),
+        ("named", ["forbidden"], []),
+        ("broad", ["allowed-a", "forbidden"], ["allowed-a", "forbidden"]),
+        ("none", ["allowed-a", "forbidden"], []),
+    ],
+)
+def test_graphql_experiment_scope_reaches_real_resolver_and_store(
+    graphql_experiment_search, field, operation, use_variables, access, names, expected
+):
+    search = graphql_experiment_search
+    if access != "named":
+        search.authorizer.is_allowed.side_effect = None
+        search.authorizer.is_allowed.return_value = access == "broad"
+    ids = [search.experiments[name] for name in names]
+    selection = (
+        "runs {info {experimentId}}"
+        if field == "mlflowSearchRuns"
+        else "datasetSummaries {experimentId name}"
+    )
+    input_type = (
+        "MlflowSearchRunsInput" if field == "mlflowSearchRuns" else "MlflowSearchDatasetsInput"
+    )
+    if use_variables:
+        query = f"{operation}($input: {input_type}) {{ {field}(input: $input) {{ {selection} }} }}"
+        variables = {"input": {"experimentIds": ids}}
+    else:
+        query = f"{operation} {{ {field}(input: {{experimentIds: {json.dumps(ids)}}}) {{ {selection} }} }}"
+        variables = None
+    value = search.execute(query, variables)[field]
+    if not expected:
+        assert value is None
+        return
+    if field == "mlflowSearchRuns":
+        got = [row["info"]["experimentId"] for row in value["runs"]]
+    else:
+        got = [row["experimentId"] for row in value["datasetSummaries"]]
+    assert sorted(got) == sorted(search.experiments[name] for name in expected)
+
+
+@pytest.mark.parametrize("operation", ["query", "mutation"])
+def test_graphql_experiment_scope_preserves_aliases_and_pagination(
+    graphql_experiment_search, operation
+):
+    search = graphql_experiment_search
+    ids = [search.experiments[name] for name in ("allowed-a", "allowed-b", "forbidden")]
+    query = f"""{operation}($input: MlflowSearchRunsInput, $forbidden: MlflowSearchRunsInput) {{
+        first: mlflowSearchRuns(input: $input) {{runs {{info {{experimentId}}}} nextPageToken}}
+        same: mlflowSearchRuns(input: $input) {{runs {{info {{experimentId}}}} nextPageToken}}
+        denied: mlflowSearchRuns(input: $forbidden) {{runs {{info {{experimentId}}}}}}
+    }}"""
+    collected = []
+    page_token = None
+    for _ in range(4):
+        input_value = {
+            "experimentIds": ids,
+            "maxResults": 1,
+            "orderBy": ["attributes.run_id ASC"],
+            "filter": "attributes.status = 'RUNNING'",
+        }
+        if page_token:
+            input_value["pageToken"] = page_token
+        data = search.execute(
+            query,
+            {
+                "input": input_value,
+                "forbidden": {"experimentIds": [search.experiments["forbidden"]]},
+            },
+        )
+        assert data["denied"] is None
+        assert data["first"] == data["same"]
+        collected.extend(row["info"]["experimentId"] for row in data["first"]["runs"])
+        page_token = data["first"]["nextPageToken"]
+        if not page_token:
+            break
+    assert not page_token
+    assert sorted(collected) == sorted(
+        search.experiments[name] for name in ("allowed-a", "allowed-b")
+    )

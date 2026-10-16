@@ -117,6 +117,10 @@ class _NameLookupCache:
         with self._lock:
             self._entries.pop(cache_key, None)
 
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
 
 _experiment_name_cache = _NameLookupCache(
     _EXPERIMENT_NAME_CACHE_TTL_SECONDS,
@@ -309,6 +313,28 @@ def _resolve_experiment_name_from_experiment_id(experiment_id: str) -> str:
         )
     _experiment_name_cache.set(experiment_id, experiment_name)
     return experiment_name
+
+
+def resolve_experiment_ids_from_names(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve already-authorized names using fresh, workspace-scoped exact lookups."""
+    store = _get_tracking_store()
+    experiment_ids: list[str] = []
+    for name in dict.fromkeys(names):
+        try:
+            experiment = store.get_experiment_by_name(name)
+        except MlflowException as exc:
+            raise ResourceNameResolutionError(
+                f"Could not resolve experiment named '{name}'."
+            ) from exc
+        if experiment is None:
+            continue
+        if getattr(experiment, "name", None) != name:
+            raise ResourceNameResolutionError("Experiment name lookup returned a different name.")
+        experiment_id = _normalize_string(getattr(experiment, "experiment_id", None))
+        if experiment_id is None:
+            raise ResourceNameResolutionError("Experiment name lookup returned no ID.")
+        experiment_ids.append(experiment_id)
+    return tuple(dict.fromkeys(experiment_ids))
 
 
 def _resolve_experiment_name_from_run_id(run_id: str) -> str:
@@ -1079,13 +1105,18 @@ def apply_response_cache_updates(
     *,
     status_code: int,
 ) -> None:
-    """Refresh short-lived name caches from successful write responses.
-
-    Today this is used to keep experiment-id-to-name fallback lookups current after renames so
-    follow-up resourceName authorization checks can avoid a tracking-store round trip.
-    """
+    """Refresh or invalidate experiment-name cache entries after successful writes."""
     if status_code >= 400:
         return
+
+    if request_context.path in {
+        "/api/2.0/mlflow/experiments/delete",
+        "/ajax-api/2.0/mlflow/experiments/delete",
+    }:
+        try:
+            _experiment_name_cache.invalidate(_get_request_param(request_context, "experiment_id"))
+        except ResourceNameResolutionError:
+            pass
 
     parser_ids = {parser_id for rule in rules for parser_id in rule.resource_name_parsers}
     if {
@@ -1098,6 +1129,7 @@ def apply_response_cache_updates(
                 _get_request_param(request_context, "new_name"),
             )
         except ResourceNameResolutionError:
+            _experiment_name_cache.clear()
             return
 
 

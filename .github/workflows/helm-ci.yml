@@ -4,12 +4,18 @@ on:
   pull_request:
     paths:
       - "charts/**"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "mlflow_kubernetes_plugins/**"
       - ".github/workflows/helm-ci.yml"
   push:
     branches:
       - main
     paths:
       - "charts/**"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "mlflow_kubernetes_plugins/**"
       - ".github/workflows/helm-ci.yml"
   workflow_dispatch:
 
@@ -229,6 +235,11 @@ jobs:
           version: v0.29.0
           cluster_name: mlflow-chart
 
+      - name: Build and load checkout image
+        run: |
+          docker build --tag mlflow-integration:ci .
+          kind load docker-image mlflow-integration:ci --name mlflow-chart
+
       - name: Install MLflow chart
         run: |
           helm upgrade --install mlflow charts/mlflow \
@@ -236,7 +247,10 @@ jobs:
             --create-namespace \
             --wait \
             --timeout 5m \
-            -f charts/mlflow/ci/values-standalone.yaml
+            -f charts/mlflow/ci/values-standalone.yaml \
+            --set image.repository=mlflow-integration \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never
           kubectl rollout status deployment/mlflow \
             --namespace mlflow \
             --timeout 2m

@@ -38,6 +38,36 @@ subjects:
     name: {{ include "mlflow.traceArchival.fullname" . }}
     namespace: {{ include "mlflow.namespace" . }}
 {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "mlflow.fullname" . }}-sar-scope
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+rules:
+  # Limit forwarded-user impersonation to permission discovery (SSRR).
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["users", "groups"]
+    verbs: ["impersonate:user-info"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["selfsubjectrulesreviews"]
+    verbs: ["impersonate-on:user-info:create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "mlflow.fullname" . }}-sar-scope
+  labels:
+    {{- include "mlflow.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "mlflow.fullname" . }}-sar-scope
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mlflow.fullname" . }}
+    namespace: {{ include "mlflow.namespace" . }}
 {{- if .Values.garbageCollection.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

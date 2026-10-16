@@ -382,9 +382,11 @@ def create_kubernetes_workspace_store(workspace_uri: str, **_kwargs) -> Kubernet
     """
 
     options = _parse_workspace_uri_options(workspace_uri)
+    label_selector = options.get("label_selector")
+    default_workspace = options.get("default_workspace")
     return KubernetesWorkspaceProvider(
         tracking_uri=workspace_uri,
-        label_selector=options.get("label_selector"),
-        default_workspace=options.get("default_workspace"),
+        label_selector=label_selector if isinstance(label_selector, str) else None,
+        default_workspace=default_workspace if isinstance(default_workspace, str) else None,
         namespace_exclude_globs=options.get("namespace_exclude_globs"),
     )
