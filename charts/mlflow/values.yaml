@@ -167,6 +167,9 @@ istio:
 # NetworkPolicy for MLflow pods. Disabled for maximum standalone compatibility.
 networkPolicy:
   enabled: false
+  # Complete ingress rules. When empty, the chart permits ingress from every
+  # namespace for standalone compatibility.
+  ingressRules: []
   # Replaces the chart's default egress rules when non-empty.
   egressRules: []
   # Appended to either the default or user-supplied egress rules.
