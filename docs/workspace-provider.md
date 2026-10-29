@@ -15,6 +15,25 @@ If you need the upstream MLflow workspace concepts first, read the official guid
 - exposes resolved artifact root overrides through workspace metadata when available
 - keeps workspace CRUD read-only because namespace management belongs to Kubernetes
 
+### Namespace Cache Recovery
+
+Each MLflow worker maintains its own namespace cache. A lookup that misses the cache
+verifies the namespace against Kubernetes before returning "workspace not found". This
+uses a namespace list filtered by `metadata.name` and the configured label selector;
+namespace exclusions still apply. It uses the existing `list` permission and does not
+create namespaces or require additional RBAC permissions. Cached lookups remain local;
+repeated misses query Kubernetes again until the watch catches up, without negative caching.
+Lookup permission failures and API connectivity failures are surfaced as errors, rather
+than being reported as missing workspaces.
+
+Namespace API requests use a 5-second connection timeout and a 30-second read timeout.
+Namespace watches request a 300-second server-side duration and use a 330-second idle
+read timeout so a stalled stream can reconnect. After a watch ends or fails, the worker
+relists namespaces before starting a new watch, repairing missed additions, changes,
+and deletions. Workspace listings and cache hits still use the cache and can lag behind
+Kubernetes until the watch processes events or a relist completes. The other caches
+(MLflowConfig and artifact connection Secrets) are unchanged.
+
 ## Installation
 
 ```bash

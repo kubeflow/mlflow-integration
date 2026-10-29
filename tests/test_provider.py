@@ -192,6 +192,47 @@ def test_get_workspace_missing_namespace_uses_ui_compatible_prefix(core_api):
     assert "Each MLflow workspace maps 1:1 to a namespace." in exc.value.message
 
 
+def test_get_workspace_created_after_cache_initialization(core_api, monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.threading.Thread.start",
+        lambda self: None,
+    )
+    core_api.list_namespace.return_value = SimpleNamespace(
+        items=[], metadata=SimpleNamespace(resource_version="10")
+    )
+    provider = KubernetesWorkspaceProvider()
+    core_api.list_namespace.return_value = SimpleNamespace(
+        items=[_namespace("new-team", "New team")],
+        metadata=SimpleNamespace(resource_version="12"),
+    )
+
+    workspace = provider.get_workspace("new-team")
+
+    assert workspace.name == "new-team"
+    assert workspace.description == "New team"
+    assert workspace.default_artifact_root is None
+    assert core_api.list_namespace.call_args.kwargs["field_selector"] == "metadata.name=new-team"
+    core_api.create_namespace.assert_not_called()
+
+
+def test_get_workspace_live_lookup_forbidden_is_not_not_found(core_api, monkeypatch):
+    monkeypatch.setattr(
+        "mlflow_kubernetes_plugins.workspace_plugin.caches.threading.Thread.start",
+        lambda self: None,
+    )
+    core_api.list_namespace.return_value = SimpleNamespace(
+        items=[], metadata=SimpleNamespace(resource_version="10")
+    )
+    provider = KubernetesWorkspaceProvider()
+    core_api.list_namespace.side_effect = ApiException(status=403)
+
+    with pytest.raises(MlflowException) as exc:
+        provider.get_workspace("new-team")
+
+    assert exc.value.error_code == "PERMISSION_DENIED"
+    core_api.create_namespace.assert_not_called()
+
+
 def test_get_default_workspace_env(core_api, monkeypatch):
     monkeypatch.setenv("MLFLOW_K8S_DEFAULT_WORKSPACE", "shared")
     core_api.list_namespace.return_value = SimpleNamespace(

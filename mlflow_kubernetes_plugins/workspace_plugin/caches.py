@@ -13,7 +13,13 @@ from kubernetes import watch
 from kubernetes.client import CoreV1Api, CustomObjectsApi
 from kubernetes.client.exceptions import ApiException
 from mlflow.exceptions import MlflowException
-from mlflow.protos.databricks_pb2 import INTERNAL_ERROR, INVALID_PARAMETER_VALUE
+from mlflow.protos.databricks_pb2 import (
+    INTERNAL_ERROR,
+    INVALID_PARAMETER_VALUE,
+    PERMISSION_DENIED,
+    UNAUTHENTICATED,
+)
+from urllib3.exceptions import HTTPError
 
 _logger = logging.getLogger(__name__)
 
@@ -25,6 +31,12 @@ MLFLOW_CONFIG_VERSION = "v1"
 MLFLOW_CONFIG_PLURAL = "mlflowconfigs"
 
 ARTIFACT_CONNECTION_SECRET_NAME = "mlflow-artifact-connection"
+
+# Bound both connection establishment and idle reads. The watch read timeout
+# exceeds the server-side duration so an idle stream normally closes cleanly.
+NAMESPACE_REQUEST_TIMEOUT = (5, 30)
+NAMESPACE_WATCH_SECONDS = 300
+NAMESPACE_WATCH_TIMEOUT = (5, NAMESPACE_WATCH_SECONDS + 30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +92,44 @@ class NamespaceCache:
     def get_namespace(self, name: str) -> NamespaceInfo | None:
         self._wait_until_ready()
         with self._lock:
-            return self._namespaces.get(name)
+            info = self._namespaces.get(name)
+        if info is not None:
+            return info
+        if self._is_excluded(name):
+            return None
+
+        # Workers have independent caches and a stalled watch can miss a newly
+        # created namespace. Ask Kubernetes before declaring it absent. Use a
+        # filtered LIST rather than GET so Kubernetes evaluates label selectors
+        # (including set-based selectors) exactly as it does for the watch.
+        try:
+            response = self._api.list_namespace(
+                field_selector=f"metadata.name={name}",
+                label_selector=self._label_selector,
+                watch=False,
+                _request_timeout=NAMESPACE_REQUEST_TIMEOUT,
+            )
+        except ApiException as exc:
+            code = {401: UNAUTHENTICATED, 403: PERMISSION_DENIED}.get(exc.status, INTERNAL_ERROR)
+            raise MlflowException(
+                f"Failed to verify Kubernetes namespace '{name}' (HTTP {exc.status}). "
+                "Check Kubernetes API connectivity and namespace list permissions.",
+                code,
+            ) from exc
+        except HTTPError as exc:
+            raise MlflowException(
+                f"Failed to verify Kubernetes namespace '{name}'. "
+                "Check Kubernetes API connectivity.",
+                INTERNAL_ERROR,
+            ) from exc
+
+        for namespace in response.items or []:
+            info = self._extract_info(namespace)
+            if info is not None and info.name == name:
+                # Do not write this response into the watch cache or change its
+                # resource version: a concurrent watch event may be newer.
+                return info
+        return None
 
     def _wait_until_ready(self) -> None:
         # Namespace listings depend on a background watch loop that typically initializes within
@@ -96,7 +145,11 @@ class NamespaceCache:
 
     def _refresh_full(self) -> None:
         try:
-            response = self._api.list_namespace(label_selector=self._label_selector, watch=False)
+            response = self._api.list_namespace(
+                label_selector=self._label_selector,
+                watch=False,
+                _request_timeout=NAMESPACE_REQUEST_TIMEOUT,
+            )
         except ApiException as exc:  # pragma: no cover - depends on live cluster
             raise MlflowException(
                 f"Failed to list Kubernetes namespaces: {exc}",
@@ -119,14 +172,14 @@ class NamespaceCache:
 
         self._ready_event.set()
 
-    def _run(self) -> None:  # pragma: no cover - background thread
+    def _run(self) -> None:
         while not self._stop_event.is_set():
             if self._resource_version is None:
                 try:
                     self._refresh_full()
-                except MlflowException:
+                except (MlflowException, HTTPError):
                     _logger.warning("Failed to refresh namespaces; retrying shortly", exc_info=True)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
                     continue
 
             watcher = watch.Watch()
@@ -135,28 +188,53 @@ class NamespaceCache:
                     self._api.list_namespace,
                     label_selector=self._label_selector,
                     resource_version=self._resource_version,
-                    timeout_seconds=300,
+                    timeout_seconds=NAMESPACE_WATCH_SECONDS,
+                    _request_timeout=NAMESPACE_WATCH_TIMEOUT,
                 ):
                     if self._stop_event.is_set():
                         watcher.stop()
                         break
                     self._handle_event(event)
+                    if self._resource_version is None:
+                        break
             except ApiException as exc:
                 if exc.status == 410:
                     _logger.debug("Namespace watch resource version expired; resyncing.")
                     self._resource_version = None
                 else:
                     _logger.warning("Namespace watch error: %s", exc)
-                    time.sleep(2)
+                    self._stop_event.wait(2)
             except Exception:
                 _logger.exception("Unexpected error in namespace watch loop")
-                time.sleep(2)
+                self._stop_event.wait(2)
             else:
-                time.sleep(1)
+                self._stop_event.wait(1)
+            finally:
+                watcher.stop()
+                # Relist after every stream, including clean timeout/EOF. This
+                # repairs missed updates instead of trusting an old snapshot
+                # indefinitely, and recovers expired resource versions.
+                self._resource_version = None
 
     def _handle_event(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         obj = event.get("object")
+        # Status errors and bookmarks need not carry metadata.name. Handle them
+        # before the name guard so they can trigger resync or advance the cursor.
+        if event_type == "ERROR":
+            with self._lock:
+                self._resource_version = None
+            return
+        if event_type == "BOOKMARK":
+            if isinstance(obj, dict):
+                metadata = obj.get("metadata", {})
+                resource_version = metadata.get("resourceVersion")
+            else:
+                metadata = getattr(obj, "metadata", None)
+                resource_version = getattr(metadata, "resource_version", None)
+            with self._lock:
+                self._resource_version = resource_version or self._resource_version
+            return
         if not obj:
             return
 
@@ -178,11 +256,6 @@ class NamespaceCache:
             elif event_type == "DELETED":
                 self._namespaces.pop(name, None)
                 self._resource_version = resource_version
-            elif event_type == "BOOKMARK":
-                self._resource_version = resource_version or self._resource_version
-            elif event_type == "ERROR":
-                self._resource_version = None
-                return
             else:
                 # Unknown event type; trigger a resync.
                 self._resource_version = None
