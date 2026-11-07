@@ -87,14 +87,13 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
-        mlflow-version: ["3.17", "f566a42"]
+        mlflow-version: ["3.17", "3.18"]
         kubernetes-version: [">=29.0.0"]
         include:
           - mlflow-version: "3.17"
             mlflow-requirement: "mlflow~=3.17.0"
-          # Skill registry support: replace this commit with released MLflow 3.18.
-          - mlflow-version: "f566a42"
-            mlflow-requirement: "mlflow @ git+https://github.com/mlflow/mlflow.git@f566a42d64fce8997fe187edb5229221ace09713"
+          - mlflow-version: "3.18"
+            mlflow-requirement: "mlflow~=3.18.0"
           - python-version: "3.12"
             mlflow-version: "3.17"
             kubernetes-version: "==29.0.0"
@@ -128,9 +127,8 @@ jobs:
         mlflow:
           - name: "3.17"
             requirement: "mlflow~=3.17.0"
-          # Skill registry support: replace this commit with released MLflow 3.18.
-          - name: "f566a42"
-            requirement: "mlflow @ git+https://github.com/mlflow/mlflow.git@f566a42d64fce8997fe187edb5229221ace09713"
+          - name: "3.18"
+            requirement: "mlflow~=3.18.0"
     env:
       _MLFLOW_STATIC_PREFIX: /mlflow
       UV_RUN: uv run --no-sync

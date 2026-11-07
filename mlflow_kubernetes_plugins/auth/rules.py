@@ -128,7 +128,15 @@ PATH_AUTHORIZATION_RULES: dict[
     tuple[str, str], AuthorizationRule | tuple[AuthorizationRule, ...]
 ] = dict(BASE_PATH_AUTHORIZATION_RULES)
 
-from mlflow_kubernetes_plugins.auth._compat import HAS_SKILL_REGISTRY  # noqa: E402
+from mlflow_kubernetes_plugins.auth._compat import (  # noqa: E402
+    HAS_MLFLOW_3_18_AUTH_SURFACE,
+    HAS_SKILL_REGISTRY,
+)
+
+if HAS_MLFLOW_3_18_AUTH_SURFACE:
+    from mlflow_kubernetes_plugins.auth.rules_v3_18 import apply_v3_18_deltas
+
+    apply_v3_18_deltas(REQUEST_AUTHORIZATION_RULES, PATH_AUTHORIZATION_RULES)
 
 if HAS_SKILL_REGISTRY:
     from mlflow_kubernetes_plugins.auth.rules_skill_registry import apply_skill_registry_deltas
