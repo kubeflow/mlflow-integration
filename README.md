@@ -26,7 +26,7 @@ start with the official guide: <https://mlflow.org/docs/latest/self-hosting/work
 
 ## Install
 
-This release requires MLflow 3.17 (`>=3.17.0,<3.18.0`).
+This release requires MLflow 3.17 or 3.18 (`>=3.17.0,<3.19.0`).
 
 Install from PyPI:
 

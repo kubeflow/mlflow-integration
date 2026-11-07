@@ -77,6 +77,7 @@ from mlflow_kubernetes_plugins.auth._compat import (
     HAS_MLFLOW_3_15_AUTH_SURFACE,
     HAS_MLFLOW_3_16_AUTH_SURFACE,
     HAS_MLFLOW_3_17_AUTH_SURFACE,
+    HAS_MLFLOW_3_18_AUTH_SURFACE,
     HAS_SKILL_REGISTRY,
     AddGuardrailToEndpoint,
     AddItemsToReviewQueue,
@@ -6808,3 +6809,16 @@ def test_resolve_resource_names_rejects_conflicting_gateway_path_and_model():
             ),
             (RESOURCE_NAME_PARSER_GATEWAY_PROXY_ENDPOINT_NAME,),
         )
+
+
+def test_mlflow_318_path_authorization_rules_cover_new_endpoints():
+    if not HAS_MLFLOW_3_18_AUTH_SURFACE:
+        pytest.skip("Installed MLflow version does not expose the 3.18 routes.")
+
+    assert PATH_AUTHORIZATION_RULES[
+        ("/ajax-api/3.0/mlflow/issues/schedule/state", "POST")
+    ] == AuthorizationRule(
+        "update",
+        resource=RESOURCE_EXPERIMENTS,
+        resource_name_parsers=(RESOURCE_NAME_PARSER_EXPERIMENT_ID_TO_NAME,),
+    )
